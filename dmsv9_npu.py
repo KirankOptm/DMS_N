@@ -933,17 +933,33 @@ class HandLandmarkDetector:
             elif shape == (1, 63):
                 lm_indices.append(i)
         
-        # MediaPipe hand_landmark output order (confirmed by testing):
-        # Output 0: landmarks [1,63]    → lm_indices[0]
-        # Output 1: hand_flag  [1,1]    → score_indices[0] = PRESENCE (not handedness!)
-        # Output 2: handedness [1,1]    → score_indices[1] = HANDEDNESS
-        # Output 3: world_lm  [1,63]   → lm_indices[1]
+        # Output mapping: try by name first, fall back to positional order
+        # We log BOTH [1,1] outputs so user can identify which is which
         if len(score_indices) >= 2:
-            self.presence_idx = self.output_details[score_indices[0]]['index']
-            self.presence_detail = self.output_details[score_indices[0]]
-            self.handedness_idx = self.output_details[score_indices[1]]['index']
-            self.handedness_detail = self.output_details[score_indices[1]]
-            print(f"[HandLandmark] presence=output[{score_indices[0]}], handedness=output[{score_indices[1]}]")
+            # Check output names to map correctly
+            name0 = self.output_details[score_indices[0]].get('name', '').lower()
+            name1 = self.output_details[score_indices[1]].get('name', '').lower()
+            
+            # Try name-based mapping
+            if 'hand' in name0 and 'flag' in name0 or 'presence' in name0:
+                pres_i, hand_i = 0, 1
+            elif 'hand' in name1 and 'flag' in name1 or 'presence' in name1:
+                pres_i, hand_i = 1, 0
+            elif 'handedness' in name0:
+                pres_i, hand_i = 1, 0
+            elif 'handedness' in name1:
+                pres_i, hand_i = 0, 1
+            else:
+                # Default: second [1,1] = handedness, first [1,1] = presence
+                # (reverted to original order that had no purple dots)
+                pres_i, hand_i = 1, 0
+            
+            self.handedness_idx = self.output_details[score_indices[hand_i]]['index']
+            self.handedness_detail = self.output_details[score_indices[hand_i]]
+            self.presence_idx = self.output_details[score_indices[pres_i]]['index']
+            self.presence_detail = self.output_details[score_indices[pres_i]]
+            print(f"[HandLandmark] score outputs: [{score_indices[0]}] name='{name0}', [{score_indices[1]}] name='{name1}'")
+            print(f"[HandLandmark] MAPPED: presence=output[{score_indices[pres_i]}], handedness=output[{score_indices[hand_i]}]")
         if len(lm_indices) >= 2:
             self.landmark_idx = self.output_details[lm_indices[0]]['index']
             self.landmark_detail = self.output_details[lm_indices[0]]
@@ -996,6 +1012,15 @@ class HandLandmarkDetector:
             raw_hand = float(dequantize_tensor(
                 self.interpreter, self.handedness_idx, self.handedness_detail).flatten()[0])
             handedness = 1.0 / (1.0 + np.exp(-raw_hand))  # sigmoid
+        
+        # Diagnostic: print raw logits for first 10 inferences to identify outputs
+        if not hasattr(self, '_diag_n'):
+            self._diag_n = 0
+        self._diag_n += 1
+        if self._diag_n <= 10:
+            print(f"[HandLM-RAW#{self._diag_n}] presence_raw={raw_presence:.4f}->sig={presence:.4f}, "
+                  f"handedness_raw={raw_hand:.4f}->sig={handedness:.4f}, "
+                  f"input_dtype={self.input_dtype}, input_scale={self.input_scale:.6f}, input_zp={self.input_zp}")
         
         if self.landmark_idx is None:
             return presence, None, handedness
