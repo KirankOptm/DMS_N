@@ -852,7 +852,7 @@ class PalmDetector:
             by1 = max(0, by1 - my)
             bx2 = min(w, bx2 + mx)
             by2 = min(h, by2 + my)
-            if (bx2 - bx1) > 50 and (by2 - by1) > 50:
+            if (bx2 - bx1) > 70 and (by2 - by1) > 70:
                 results.append((bx1, by1, bx2, by2))
         
         return results
@@ -1003,26 +1003,44 @@ class HandLandmarkDetector:
         lm[:, 1] /= self.input_h
         lm[:, 2] /= self.input_w
         
-        # Landmark quality check: real hands produce spread-out landmarks,
-        # noise/background crops produce clustered garbage points.
-        # A vertical hand has more y-spread, horizontal hand more x-spread,
-        # so check the MAXIMUM of the two spreads (not both).
+        # Landmark quality check — multi-criteria to reject garbage from PTQ model:
         x_spread = lm[:, 0].max() - lm[:, 0].min()
         y_spread = lm[:, 1].max() - lm[:, 1].min()
-        MIN_SPREAD = 0.15
-        if max(x_spread, y_spread) < MIN_SPREAD:
-            if self._diag_n <= 20:
-                print(f"[HandLM-QUALITY] REJECTED: x_spread={x_spread:.3f}, y_spread={y_spread:.3f}, max={max(x_spread,y_spread):.3f} < {MIN_SPREAD}")
+        
+        # Check 1: Both dimensions must have SOME spread (eliminates collapsed outputs)
+        # A real hand always has spread in both axes, even if one is small.
+        if x_spread < 0.03 or y_spread < 0.03:
+            if self._diag_n <= 30:
+                print(f"[HandLM-QUALITY] REJECTED: min spread too low x={x_spread:.3f}, y={y_spread:.3f}")
             return presence, None, handedness
         
-        # Also reject if landmarks are mostly outside [0,1] range (garbage)
+        # Check 2: At least one dimension must have significant spread (>= 0.20)
+        if max(x_spread, y_spread) < 0.20:
+            if self._diag_n <= 30:
+                print(f"[HandLM-QUALITY] REJECTED: max spread={max(x_spread,y_spread):.3f} < 0.20")
+            return presence, None, handedness
+        
+        # Check 3: Landmarks mostly within valid [0,1] range (garbage often falls outside)
         in_range = np.logical_and(
-            np.logical_and(lm[:, 0] >= -0.2, lm[:, 0] <= 1.2),
-            np.logical_and(lm[:, 1] >= -0.2, lm[:, 1] <= 1.2)
+            np.logical_and(lm[:, 0] >= -0.1, lm[:, 0] <= 1.1),
+            np.logical_and(lm[:, 1] >= -0.1, lm[:, 1] <= 1.1)
         )
-        if np.mean(in_range) < 0.6:  # less than 60% of landmarks in valid range
-            if self._diag_n <= 20:
+        if np.mean(in_range) < 0.7:  # at least 70% of landmarks in valid range
+            if self._diag_n <= 30:
                 print(f"[HandLM-QUALITY] REJECTED: only {np.mean(in_range)*100:.0f}% landmarks in valid range")
+            return presence, None, handedness
+        
+        # Check 4: Anatomical plausibility — middle fingertip (12) should be
+        # significantly farther from wrist (0) than palm base (9).
+        # This detects random scatter vs real hand structure.
+        wrist = lm[0, :2]  # landmark 0 = wrist
+        palm_base = lm[9, :2]  # landmark 9 = middle finger MCP
+        fingertip = lm[12, :2]  # landmark 12 = middle finger tip
+        d_wrist_palm = np.linalg.norm(fingertip - wrist)
+        d_wrist_base = np.linalg.norm(palm_base - wrist)
+        if d_wrist_palm < 0.10 or (d_wrist_base > 0.01 and d_wrist_palm < d_wrist_base * 0.8):
+            if self._diag_n <= 30:
+                print(f"[HandLM-QUALITY] REJECTED: anatomy check d_tip={d_wrist_palm:.3f} d_base={d_wrist_base:.3f}")
             return presence, None, handedness
         
         # Create LandmarkPoint list
@@ -1120,7 +1138,7 @@ parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_ptq_vela.tflite')
 parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq_vela.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.25, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
+parser.add_argument('--palm_det_threshold', type=float, default=0.20, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
 parser.add_argument('--hand_presence_threshold', type=float, default=0.45, help="Hand presence threshold (PTQ presence output stuck at ~0.5, rely on quality check)")
 
 args = parser.parse_args()
@@ -1686,6 +1704,20 @@ while cap.isOpened():
             bw = px2 - px1
             bh = py2 - py1
             detected_palm_positions.append((cx_norm, cy_norm, bw, bh))
+            
+            # Skip HandLM for palm boxes far from face (prevents random landmarks)
+            # Only run HandLM if palm box is within 2x face dimensions of face center
+            if face_box is not None:
+                f_cx = (face_box[0] + face_box[2]) / 2
+                f_cy = (face_box[1] + face_box[3]) / 2
+                f_h = face_box[3] - face_box[1]
+                palm_cx_px = (px1 + px2) / 2
+                palm_cy_px = (py1 + py2) / 2
+                palm_face_dist = np.hypot(palm_cx_px - f_cx, palm_cy_px - f_cy)
+                if palm_face_dist > f_h * 2.5:
+                    if fid % 30 == 0:
+                        print(f"[HandLM] Skipped — palm too far from face ({palm_face_dist:.0f}px > {f_h*2.5:.0f}px)")
+                    continue
             
             # Crop palm region with margin for HandLM
             margin = 0.25
