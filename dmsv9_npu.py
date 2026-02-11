@@ -1688,40 +1688,20 @@ while cap.isOpened():
                 cached_hand_landmarks_list = []
     
     # Run hand landmark on detected palms (every frame if palm cached)
+    # NOTE: HandLM model is non-functional on NPU (all landmarks collapse to one point).
+    # Instead, use palm box position directly for hand-near-face/ear detection.
+    # Palm box center is sufficient — we don't need 21 landmarks for proximity checks.
+    detected_palm_positions = []  # list of (cx_norm, cy_norm, box_w, box_h) in normalized coords
     if len(cached_palm_boxes) > 0:
-        new_hand_lm_list = []
         for palm_box in cached_palm_boxes:
             px1, py1, px2, py2 = palm_box
-            hand_crop = frame[py1:py2, px1:px2]
-            if hand_crop is not None and hand_crop.size > 0:
-                presence, hand_lms, handedness = hand_landmark_detector.predict(hand_crop)
-                handlm_diag_count += 1
-                # Always log first 50 HandLM inferences + every 30th frame thereafter
-                if handlm_diag_count <= 50 or fid % 30 == 0:
-                    print(f"[HandLM#{handlm_diag_count}] palm=({px1},{py1})-({px2},{py2}) sz={px2-px1}x{py2-py1} "
-                          f"presence={presence:.4f} handedness={handedness:.3f} has_lms={hand_lms is not None} "
-                          f"thresh={args.hand_presence_threshold} pass={'YES' if presence > args.hand_presence_threshold else 'NO'}")
-                if hand_lms is not None and presence > args.hand_presence_threshold:
-                    # Convert hand landmarks from crop-relative to frame coords (normalized 0-1)
-                    crop_w_px = px2 - px1
-                    crop_h_px = py2 - py1
-                    frame_hand_lms = []
-                    for lm in hand_lms:
-                        fx = (px1 + lm.x * crop_w_px) / w
-                        fy = (py1 + lm.y * crop_h_px) / h
-                        fz = lm.z
-                        frame_hand_lms.append(LandmarkPoint(fx, fy, fz))
-                    new_hand_lm_list.append((frame_hand_lms, handedness))
-        
-        if len(new_hand_lm_list) > 0:
-            cached_hand_landmarks_list = new_hand_lm_list
-        else:
-            # Hand landmark model rejected ALL crops — clear both caches
-            # This prevents stale palm boxes from retrying HandLM every frame
-            cached_hand_landmarks_list = []
-            cached_palm_boxes = []
-            hand_lost_count = 0
-        detected_hands = cached_hand_landmarks_list
+            cx_norm = ((px1 + px2) / 2) / w
+            cy_norm = ((py1 + py2) / 2) / h
+            bw = px2 - px1
+            bh = py2 - py1
+            detected_palm_positions.append((cx_norm, cy_norm, bw, bh))
+            if fid % 30 == 0:
+                print(f"[Palm-Direct] box=({px1},{py1})-({px2},{py2}) center=({cx_norm:.3f},{cy_norm:.3f})")
     
     # FPS calculation
     frame_end = time.time()
@@ -1964,48 +1944,63 @@ while cap.isOpened():
             if iris_right_center is not None:
                 cv2.circle(frame, (int(iris_right_center[0]), int(iris_right_center[1])), 3, (255, 0, 255), -1)
 
-    # ---- Hand detection alerts (with confirmation streaks to prevent false positives) ----
+    # ---- Hand detection alerts using PALM BOX POSITION (no HandLM needed) ----
     frame_hand_near_ear = False
     frame_hand_near_face = False
     frame_texting = False
     
-    if len(detected_hands) > 0 and landmarks is not None:
+    if len(detected_palm_positions) > 0 and landmarks is not None and face_box is not None:
+        fx1, fy1, fx2, fy2 = face_box
+        face_w_px = fx2 - fx1
+        face_h_px = fy2 - fy1
+        
+        # Ear positions in pixels (from face landmarks)
+        ear_l = np.array([landmarks[LEFT_EAR_TIP].x * w, landmarks[LEFT_EAR_TIP].y * h])
+        ear_r = np.array([landmarks[RIGHT_EAR_TIP].x * w, landmarks[RIGHT_EAR_TIP].y * h])
+        
+        # Asymmetric ear radius (right-side 45° camera)
+        r_ear_right = 0.25 * face_h_px  # right ear (closer)
+        r_ear_left = 0.65 * face_h_px   # left ear (farther, perspective)
+        
         hand_coords = []
-        for hand_lm_list, handedness in detected_hands:
-            # Check phone call: require BOTH near ear AND near face (matches ref)
-            near_ear = hand_near_ear(landmarks, hand_lm_list, w, h)
-            near_face = hand_near_face(face_center, hand_lm_list, w, h, args.hand_near_face_px)
+        for cx_norm, cy_norm, bw, bh in detected_palm_positions:
+            palm_cx_px = cx_norm * w
+            palm_cy_px = cy_norm * h
+            
+            # Check near ear (palm box center within ear radius)
+            dist_ear_r = np.hypot(palm_cx_px - ear_r[0], palm_cy_px - ear_r[1])
+            dist_ear_l = np.hypot(palm_cx_px - ear_l[0], palm_cy_px - ear_l[1])
+            near_ear = (dist_ear_r <= r_ear_right) or (dist_ear_l <= r_ear_left)
+            
+            # Check near face (palm center within face_h distance of face center)
+            near_face = np.hypot(palm_cx_px - face_center[0], palm_cy_px - face_center[1]) < args.hand_near_face_px
             
             if near_ear and near_face:
                 frame_hand_near_ear = True
             elif near_face:
                 frame_hand_near_face = True
             
+            hand_coords.append((cx_norm, cy_norm))
+            
             if fid % 30 == 0:
-                hcx = np.mean([lm.x for lm in hand_lm_list])
-                hcy = np.mean([lm.y for lm in hand_lm_list])
-                print(f"[Hand] center=({hcx:.2f},{hcy:.2f}) near_ear={near_ear} near_face={near_face} handedness={handedness:.2f}")
+                print(f"[Hand] center=({cx_norm:.2f},{cy_norm:.2f}) near_ear={near_ear} near_face={near_face} "
+                      f"d_ear_r={dist_ear_r:.0f} d_ear_l={dist_ear_l:.0f}")
             
-            # Collect hand center for texting detection
-            xs = [lm.x for lm in hand_lm_list]
-            ys = [lm.y for lm in hand_lm_list]
-            hand_coords.append((np.mean(xs), np.mean(ys)))
-            
-            # Draw hand landmarks MediaPipe-style (skeleton + colored joints)
+            # Draw palm box on frame
             if not args.no_mesh_display:
-                draw_hand_landmarks_mp(frame, hand_lm_list, w, h)
+                px1 = int(palm_cx_px - bw/2)
+                py1 = int(palm_cy_px - bh/2)
+                px2 = int(palm_cx_px + bw/2)
+                py2 = int(palm_cy_px + bh/2)
+                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 255), 2)  # yellow box
+                cv2.circle(frame, (int(palm_cx_px), int(palm_cy_px)), 5, (0, 255, 255), -1)
         
-        # Texting detection: 2 hands, both low, close together (matches dmsv8)
+        # Texting detection: 2 palms, both low, close together
         if not calibration_mode and len(hand_coords) == 2:
             (x1h, y1h), (x2h, y2h) = hand_coords
             dist = np.hypot(x2h - x1h, y2h - y1h)
             both_hands_low = y1h > 0.6 and y2h > 0.6
-            not_near_ears = True
-            for hand_lm_list, _ in detected_hands:
-                if hand_near_ear(landmarks, hand_lm_list, w, h):
-                    not_near_ears = False
-                    break
-            if dist < 0.35 and both_hands_low and not_near_ears:
+            if dist < 0.35 and both_hands_low and not frame_hand_near_ear:
                 frame_texting = True
     
     # Confirmation streaks: only alert after N consecutive frames (prevents random false positives)
