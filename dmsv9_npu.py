@@ -864,13 +864,12 @@ class PalmDetector:
 
 class HandLandmarkDetector:
     """
-    Hand Landmark detector using hand_landmark_lite.tflite on CPU.
-    Original float32 MediaPipe model — Vela and PTQ both break regression.
+    Hand Landmark detector using hand_landmark_ptq_vela.tflite on NPU.
     Input:  [1, 224, 224, 3] — float32, normalized [0, 1]
     Outputs (by name):
       Identity   [1, 63] — 21 landmarks × 3 (x, y, z)
-      Identity_1 [1, 1]  — presence/handedness score
-      Identity_2 [1, 1]  — presence/handedness score
+      Identity_1 [1, 1]  — presence score
+      Identity_2 [1, 1]  — handedness score
       Identity_3 [1, 63] — world landmarks (3D)
     """
     
@@ -882,9 +881,8 @@ class HandLandmarkDetector:
     RING_TIP = 16
     PINKY_TIP = 20
     
-    def __init__(self, model_path="hand_landmark_lite.tflite"):
-        # Use CPU-only loader — Vela and PTQ both destroy landmark regression
-        self.interpreter = load_cpu_model(model_path)
+    def __init__(self, model_path="hand_landmark_ptq_vela.tflite"):
+        self.interpreter = load_npu_model(model_path)
         
         self.input_details = self.interpreter.get_input_details()[0]
         self.output_details = self.interpreter.get_output_details()
@@ -893,13 +891,14 @@ class HandLandmarkDetector:
         self.input_h = self.input_shape[1]
         self.input_w = self.input_shape[2]
         
-        # Map outputs by name for correct landmark assignment
+        # Map outputs by NAME for correct landmark vs world-landmark assignment
         # Identity = landmarks [1,63], Identity_3 = world landmarks [1,63]
-        # Identity_1, Identity_2 = scores [1,1]
+        # Identity_1 = presence [1,1], Identity_2 = handedness [1,1]
         self.handedness_idx = None
         self.landmark_idx = None
         self.presence_idx = None
         self.world_lm_idx = None
+        # Store full output details for dequantization
         self.handedness_detail = None
         self.landmark_detail = None
         self.presence_detail = None
@@ -910,42 +909,28 @@ class HandLandmarkDetector:
             shape = tuple(od['shape'])
             name = od.get('name', '').lower()
             if shape[-1] == 63 and len(shape) == 2:
-                # Distinguish landmarks vs world landmarks by name
-                if 'identity_3' in name or 'identity_3:0' in name:
+                # Identity = landmarks, Identity_3 = world landmarks
+                if 'identity_3' in name:
                     self.world_lm_idx = od['index']
                     self.world_lm_detail = od
                     print(f"[HandLandmark] Output {i} '{od['name']}' -> WORLD_LANDMARKS")
-                elif 'identity:' in name or name == 'identity' or (self.landmark_idx is None and 'identity_3' not in name):
+                else:
                     self.landmark_idx = od['index']
                     self.landmark_detail = od
                     print(f"[HandLandmark] Output {i} '{od['name']}' -> LANDMARKS")
-                else:
-                    # Second [1,63] = world landmarks if not already assigned
-                    if self.world_lm_idx is None:
-                        self.world_lm_idx = od['index']
-                        self.world_lm_detail = od
-                        print(f"[HandLandmark] Output {i} '{od['name']}' -> WORLD_LANDMARKS (fallback)")
-                    else:
-                        self.landmark_idx = od['index']
-                        self.landmark_detail = od
-                        print(f"[HandLandmark] Output {i} '{od['name']}' -> LANDMARKS (fallback)")
             elif shape[-1] == 1:
                 score_indices.append(i)
         
-        # Map the two [1,1] score outputs
+        # Map the two [1,1] score outputs by name
+        # Identity_1 = presence, Identity_2 = handedness
         if len(score_indices) >= 2:
             name0 = self.output_details[score_indices[0]].get('name', '').lower()
             name1 = self.output_details[score_indices[1]].get('name', '').lower()
             
-            # Identity_1 = presence, Identity_2 = handedness (MediaPipe convention)
             if 'identity_1' in name0:
                 pres_i, hand_i = 0, 1
             elif 'identity_1' in name1:
                 pres_i, hand_i = 1, 0
-            elif 'identity_2' in name0:
-                pres_i, hand_i = 1, 0
-            elif 'identity_2' in name1:
-                pres_i, hand_i = 0, 1
             else:
                 pres_i, hand_i = 0, 1
             
@@ -1133,8 +1118,8 @@ parser.add_argument('--iris_landmark_model', type=str, default='iris_landmark_pt
 parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face confidence threshold from landmark model")
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_ptq_vela.tflite')
-parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_lite.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.20, help="Palm detection threshold")
+parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq_vela.tflite')
+parser.add_argument('--palm_det_threshold', type=float, default=0.20, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
 parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand presence threshold")
 
 args = parser.parse_args()
@@ -1619,16 +1604,8 @@ while cap.isOpened():
                 print(f"  palm[{i}]: ({px1},{py1})-({px2},{py2}) size={px2-px1}x{py2-py1}")
         
         # Filter out false-positive palm boxes:
-        # 1. Too small boxes (noise/artifacts)
-        # 2. Face detected as palm (centered on face + similar size)
-        # 3. Body/chest detected as palm (far below face)
-        # 4. Above face (top of frame noise)
-        
-        # FILTER 0: Minimum box size — reject tiny detections
-        MIN_PALM_SIZE = 70  # pixels, real palms at arm's length are >80px
-        palm_boxes = [(px1, py1, px2, py2) for px1, py1, px2, py2 in palm_boxes
-                      if (px2 - px1) >= MIN_PALM_SIZE and (py2 - py1) >= MIN_PALM_SIZE]
-        
+        # 1. Face detected as palm (centered on face + similar size)
+        # 2. Body/chest detected as palm (far below face)
         if face_box is not None and len(palm_boxes) > 0:
             fx1, fy1, fx2, fy2 = face_box
             face_w = fx2 - fx1
@@ -1655,17 +1632,12 @@ while cap.isOpened():
                     continue
                 
                 # FILTER 2: Body/chest region — reject palms far below face
+                # Real hands near face/ear will be at face level or slightly below
+                # Body detections are >1.5 face heights below face bottom edge
                 below_face_dist = (palm_cy - face_bottom) / max(1, face_h)
                 if below_face_dist > 1.0:
                     if fid % 30 == 0:
                         print(f"[Palm] Rejected body-region ({below_face_dist:.2f}x face_h below face)")
-                    continue
-                
-                # FILTER 3: Above face top — reject noise at top of frame
-                above_face_dist = (fy1 - palm_cy) / max(1, face_h)
-                if above_face_dist > 0.5:
-                    if fid % 30 == 0:
-                        print(f"[Palm] Rejected above-face ({above_face_dist:.2f}x face_h above face)")
                     continue
                 
                 filtered_palms.append((px1, py1, px2, py2))
