@@ -630,13 +630,13 @@ class BlazeFaceDetector:
 
 class PalmDetector:
     """
-    Palm detector using palm_detection_ptq_vela.tflite
-    Input:  [1, 192, 192, 3] — float32 I/O, INT8 internal (PTQ)
+    Palm detector using palm_detection_full_quant_vela.tflite
+    Input:  [1, 192, 192, 3] — may be int8/uint8 (full_quant) or float32 (PTQ)
     Output0: scores [1, 2016, 1]
     Output1: boxes [1, 2016, 18]  (center_x, center_y, w, h + 7 keypoints × 2)
     """
     
-    def __init__(self, model_path="palm_detection_ptq_vela.tflite", threshold=0.6):
+    def __init__(self, model_path="palm_detection_full_quant_vela.tflite", threshold=0.6):
         self.interpreter = load_npu_model(model_path)
         
         self.input_details = self.interpreter.get_input_details()[0]
@@ -772,7 +772,16 @@ class PalmDetector:
         
         img = cv2.resize(frame, (self.input_w, self.input_h))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = (img.astype(np.float32) - 128.0) / 128.0
+        
+        # Normalize and quantize input based on model dtype
+        if self.input_dtype == np.float32:
+            # PTQ model: float32 I/O, normalize to [-1, 1]
+            img = (img.astype(np.float32) - 128.0) / 128.0
+        else:
+            # full_quant model: int8/uint8 I/O, quantize using model params
+            img = img.astype(np.float32)
+            img = (img / 255.0 - 0.5) * 2.0  # normalize to [-1, 1] first
+            img = (img / self.input_scale + self.input_zp).astype(self.input_dtype)
         img = np.expand_dims(img, axis=0)
         
         self.interpreter.set_tensor(self.input_details['index'], img)
@@ -864,8 +873,8 @@ class PalmDetector:
 
 class HandLandmarkDetector:
     """
-    Hand Landmark detector using hand_landmark_ptq_vela.tflite on NPU.
-    Input:  [1, 224, 224, 3] — float32, normalized [0, 1]
+    Hand Landmark detector using hand_landmark_full_quant_vela.tflite on NPU.
+    Input:  [1, 224, 224, 3] — may be int8/uint8 (full_quant) or float32 (PTQ)
     Outputs (by name):
       Identity   [1, 63] — 21 landmarks × 3 (x, y, z)
       Identity_1 [1, 1]  — presence score
@@ -881,7 +890,7 @@ class HandLandmarkDetector:
     RING_TIP = 16
     PINKY_TIP = 20
     
-    def __init__(self, model_path="hand_landmark_ptq_vela.tflite"):
+    def __init__(self, model_path="hand_landmark_full_quant_vela.tflite"):
         self.interpreter = load_npu_model(model_path)
         
         self.input_details = self.interpreter.get_input_details()[0]
@@ -890,6 +899,24 @@ class HandLandmarkDetector:
         self.input_shape = self.input_details['shape']  # [1, 224, 224, 3]
         self.input_h = self.input_shape[1]
         self.input_w = self.input_shape[2]
+        self.input_dtype = self.input_details['dtype']
+        
+        # Input quantization parameters (for full_quant INT8 models)
+        self.input_scale = 1.0
+        self.input_zp = 0
+        inp_qp = self.input_details.get('quantization_parameters', {})
+        inp_scales = inp_qp.get('scales', None)
+        inp_zps = inp_qp.get('zero_points', None)
+        if inp_scales is not None and len(inp_scales) > 0:
+            self.input_scale = inp_scales[0]
+            self.input_zp = inp_zps[0] if inp_zps is not None and len(inp_zps) > 0 else 0
+        else:
+            legacy = self.input_details.get('quantization', (0.0, 0))
+            if legacy[0] != 0.0:
+                self.input_scale = legacy[0]
+                self.input_zp = legacy[1]
+        
+        print(f"[HandLM] Input dtype={self.input_dtype}, scale={self.input_scale}, zp={self.input_zp}")
         
         # Map outputs by NAME for correct landmark vs world-landmark assignment
         # Identity = landmarks [1,63], Identity_3 = world landmarks [1,63]
@@ -960,10 +987,17 @@ class HandLandmarkDetector:
         if hand_crop_bgr is None or hand_crop_bgr.size == 0:
             return 0.0, None, 0.0
         
-        # Preprocess: resize, BGR->RGB, normalize to [0, 1] (MediaPipe convention)
+        # Preprocess: resize, BGR->RGB, normalize/quantize based on model dtype
         img = cv2.resize(hand_crop_bgr, (self.input_w, self.input_h))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
+        
+        if self.input_dtype == np.float32:
+            # PTQ model: float32 I/O, normalize to [0, 1]
+            img = img.astype(np.float32) / 255.0
+        else:
+            # full_quant model: int8/uint8 I/O, quantize using model params
+            img = img.astype(np.float32) / 255.0  # normalize to [0, 1] first
+            img = (img / self.input_scale + self.input_zp).astype(self.input_dtype)
         img = np.expand_dims(img, axis=0)
         
         self.interpreter.set_tensor(self.input_details['index'], img)
@@ -1136,8 +1170,8 @@ parser.add_argument('--face_landmark_model', type=str, default='face_landmark_pt
 parser.add_argument('--iris_landmark_model', type=str, default='iris_landmark_ptq_vela.tflite')
 parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face confidence threshold from landmark model")
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
-parser.add_argument('--palm_detection_model', type=str, default='palm_detection_ptq_vela.tflite')
-parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq_vela.tflite')
+parser.add_argument('--palm_detection_model', type=str, default='palm_detection_full_quant_vela.tflite')
+parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_full_quant_vela.tflite')
 parser.add_argument('--palm_det_threshold', type=float, default=0.20, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
 parser.add_argument('--hand_presence_threshold', type=float, default=0.45, help="Hand presence threshold (PTQ presence output stuck at ~0.5, rely on quality check)")
 
