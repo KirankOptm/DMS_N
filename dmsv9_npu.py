@@ -933,12 +933,17 @@ class HandLandmarkDetector:
             elif shape == (1, 63):
                 lm_indices.append(i)
         
-        # Assign based on typical MediaPipe output order
+        # MediaPipe hand_landmark output order (confirmed by testing):
+        # Output 0: landmarks [1,63]    → lm_indices[0]
+        # Output 1: hand_flag  [1,1]    → score_indices[0] = PRESENCE (not handedness!)
+        # Output 2: handedness [1,1]    → score_indices[1] = HANDEDNESS
+        # Output 3: world_lm  [1,63]   → lm_indices[1]
         if len(score_indices) >= 2:
-            self.handedness_idx = self.output_details[score_indices[0]]['index']
-            self.handedness_detail = self.output_details[score_indices[0]]
-            self.presence_idx = self.output_details[score_indices[1]]['index']
-            self.presence_detail = self.output_details[score_indices[1]]
+            self.presence_idx = self.output_details[score_indices[0]]['index']
+            self.presence_detail = self.output_details[score_indices[0]]
+            self.handedness_idx = self.output_details[score_indices[1]]['index']
+            self.handedness_detail = self.output_details[score_indices[1]]
+            print(f"[HandLandmark] presence=output[{score_indices[0]}], handedness=output[{score_indices[1]}]")
         if len(lm_indices) >= 2:
             self.landmark_idx = self.output_details[lm_indices[0]]['index']
             self.landmark_detail = self.output_details[lm_indices[0]]
