@@ -852,7 +852,7 @@ class PalmDetector:
             by1 = max(0, by1 - my)
             bx2 = min(w, bx2 + mx)
             by2 = min(h, by2 + my)
-            if (bx2 - bx1) > 15 and (by2 - by1) > 15:
+            if (bx2 - bx1) > 50 and (by2 - by1) > 50:
                 results.append((bx1, by1, bx2, by2))
         
         return results
@@ -1005,13 +1005,14 @@ class HandLandmarkDetector:
         
         # Landmark quality check: real hands produce spread-out landmarks,
         # noise/background crops produce clustered garbage points.
-        # Require minimum spread of 0.15 in both x and y dimensions.
+        # A vertical hand has more y-spread, horizontal hand more x-spread,
+        # so check the MAXIMUM of the two spreads (not both).
         x_spread = lm[:, 0].max() - lm[:, 0].min()
         y_spread = lm[:, 1].max() - lm[:, 1].min()
         MIN_SPREAD = 0.15
-        if x_spread < MIN_SPREAD or y_spread < MIN_SPREAD:
+        if max(x_spread, y_spread) < MIN_SPREAD:
             if self._diag_n <= 20:
-                print(f"[HandLM-QUALITY] REJECTED: x_spread={x_spread:.3f}, y_spread={y_spread:.3f} < {MIN_SPREAD}")
+                print(f"[HandLM-QUALITY] REJECTED: x_spread={x_spread:.3f}, y_spread={y_spread:.3f}, max={max(x_spread,y_spread):.3f} < {MIN_SPREAD}")
             return presence, None, handedness
         
         # Also reject if landmarks are mostly outside [0,1] range (garbage)
@@ -1119,8 +1120,8 @@ parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_ptq_vela.tflite')
 parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq_vela.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.20, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
-parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand presence threshold")
+parser.add_argument('--palm_det_threshold', type=float, default=0.25, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.45, help="Hand presence threshold (PTQ presence output stuck at ~0.5, rely on quality check)")
 
 args = parser.parse_args()
 
@@ -1633,11 +1634,27 @@ while cap.isOpened():
                 
                 # FILTER 2: Body/chest region — reject palms far below face
                 # Real hands near face/ear will be at face level or slightly below
-                # Body detections are >1.5 face heights below face bottom edge
+                # Body detections are >1.0 face heights below face bottom edge
                 below_face_dist = (palm_cy - face_bottom) / max(1, face_h)
                 if below_face_dist > 1.0:
                     if fid % 30 == 0:
                         print(f"[Palm] Rejected body-region ({below_face_dist:.2f}x face_h below face)")
+                    continue
+                
+                # FILTER 3: Above-face — reject palms far above face top
+                # Random small boxes at top of frame (ceiling, lights) are noise
+                above_face_dist = (fy1 - palm_cy) / max(1, face_h)
+                if above_face_dist > 0.5:
+                    if fid % 30 == 0:
+                        print(f"[Palm] Rejected above-face ({above_face_dist:.2f}x face_h above face)")
+                    continue
+                
+                # FILTER 4: Min box size — reject tiny boxes (noise)
+                palm_w = px2 - px1
+                palm_h = py2 - py1
+                if palm_w < 50 or palm_h < 50:
+                    if fid % 30 == 0:
+                        print(f"[Palm] Rejected too-small ({palm_w}x{palm_h} < 50)")
                     continue
                 
                 filtered_palms.append((px1, py1, px2, py2))
@@ -2031,8 +2048,8 @@ while cap.isOpened():
                     print(f"[Hand-Palm] center=({cx_norm:.2f},{cy_norm:.2f}) near_ear={near_ear} near_face={near_face} "
                           f"d_ear_r={dist_ear_r:.0f} d_ear_l={dist_ear_l:.0f}")
                 
-                # Draw palm box on frame
-                if not args.no_mesh_display:
+                # Draw palm box on frame only if near face (avoids random yellow boxes)
+                if not args.no_mesh_display and (near_ear or near_face):
                     px1 = int(palm_cx_px - bw/2)
                     py1 = int(palm_cy_px - bh/2)
                     px2 = int(palm_cx_px + bw/2)
