@@ -1036,6 +1036,27 @@ class HandLandmarkDetector:
         lm[:, 1] /= self.input_h
         lm[:, 2] /= self.input_w
         
+        # Landmark quality check: real hands produce spread-out landmarks,
+        # noise/background crops produce clustered garbage points.
+        # Require minimum spread of 0.15 in both x and y dimensions.
+        x_spread = lm[:, 0].max() - lm[:, 0].min()
+        y_spread = lm[:, 1].max() - lm[:, 1].min()
+        MIN_SPREAD = 0.15
+        if x_spread < MIN_SPREAD or y_spread < MIN_SPREAD:
+            if self._diag_n <= 20:
+                print(f"[HandLM-QUALITY] REJECTED: x_spread={x_spread:.3f}, y_spread={y_spread:.3f} < {MIN_SPREAD}")
+            return presence, None, handedness
+        
+        # Also reject if landmarks are mostly outside [0,1] range (garbage)
+        in_range = np.logical_and(
+            np.logical_and(lm[:, 0] >= -0.2, lm[:, 0] <= 1.2),
+            np.logical_and(lm[:, 1] >= -0.2, lm[:, 1] <= 1.2)
+        )
+        if np.mean(in_range) < 0.6:  # less than 60% of landmarks in valid range
+            if self._diag_n <= 20:
+                print(f"[HandLM-QUALITY] REJECTED: only {np.mean(in_range)*100:.0f}% landmarks in valid range")
+            return presence, None, handedness
+        
         # Create LandmarkPoint list
         hand_landmarks = [LandmarkPoint(lm[i, 0], lm[i, 1], lm[i, 2]) for i in range(21)]
         
@@ -1132,7 +1153,7 @@ parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_full_quant_vela.tflite')
 parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_full_quant_vela.tflite')
 parser.add_argument('--palm_det_threshold', type=float, default=0.25, help="Palm detection threshold (INT8 model scores 0.27-0.34 for real hands, HandLM acts as 2nd-stage filter)")
-parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand landmark presence threshold (0.5=noise, 0.55+=real hand)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.40, help="Hand presence threshold (model output broken=always 0.50, set below to bypass; landmark quality check filters instead)")
 
 args = parser.parse_args()
 
