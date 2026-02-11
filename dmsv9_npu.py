@@ -622,7 +622,7 @@ class BlazeFaceDetector:
 class PalmDetector:
     """
     Palm detector using palm_detection_full_quant_vela.tflite
-    Input:  [1, 192, 192, 3] float32 normalized to [-1, 1]
+    Input:  [1, 192, 192, 3] — dtype depends on model (int8 or float32)
     Output0: scores [1, 2016, 1]
     Output1: boxes [1, 2016, 18]  (center_x, center_y, w, h + 7 keypoints × 2)
     """
@@ -636,6 +636,24 @@ class PalmDetector:
         self.input_shape = self.input_details['shape']  # [1, 192, 192, 3]
         self.input_h = self.input_shape[1]
         self.input_w = self.input_shape[2]
+        self.input_dtype = self.input_details['dtype']
+        
+        # Input quantization parameters (for INT8 models)
+        self.input_scale = 1.0
+        self.input_zp = 0
+        inp_qp = self.input_details.get('quantization_parameters', {})
+        inp_scales = inp_qp.get('scales', None)
+        inp_zps = inp_qp.get('zero_points', None)
+        if inp_scales is not None and len(inp_scales) > 0:
+            self.input_scale = inp_scales[0]
+            self.input_zp = inp_zps[0] if inp_zps is not None and len(inp_zps) > 0 else 0
+        else:
+            legacy = self.input_details.get('quantization', (0.0, 0))
+            if legacy[0] != 0.0:
+                self.input_scale = legacy[0]
+                self.input_zp = legacy[1]
+        
+        print(f"[PalmDet] Input dtype={self.input_dtype}, scale={self.input_scale}, zp={self.input_zp}")
         
         # Auto-detect score vs box outputs by shape (not position)
         # Scores: last dim = 1, Boxes: last dim = 18 (cx, cy, w, h + 7 keypoints × 2)
@@ -838,7 +856,7 @@ class PalmDetector:
 class HandLandmarkDetector:
     """
     Hand Landmark detector using hand_landmark_full_quant_vela.tflite
-    Input:  [1, 224, 224, 3] float32 normalized to [-1, 1]
+    Input:  [1, 224, 224, 3] — dtype depends on model (int8 or float32)
     Output0: [1, 1]  — handedness score (>0.5 = right hand)
     Output1: [1, 63] — 21 landmarks × 3 (x, y, z)
     Output2: [1, 1]  — hand presence/confidence
@@ -862,6 +880,38 @@ class HandLandmarkDetector:
         self.input_shape = self.input_details['shape']  # [1, 224, 224, 3]
         self.input_h = self.input_shape[1]
         self.input_w = self.input_shape[2]
+        self.input_dtype = self.input_details['dtype']
+        
+        # Input quantization parameters (for INT8 models)
+        self.input_scale = 1.0
+        self.input_zp = 0
+        inp_qp = self.input_details.get('quantization_parameters', {})
+        inp_scales = inp_qp.get('scales', None)
+        inp_zps = inp_qp.get('zero_points', None)
+        if inp_scales is not None and len(inp_scales) > 0:
+            self.input_scale = inp_scales[0]
+            self.input_zp = inp_zps[0] if inp_zps is not None and len(inp_zps) > 0 else 0
+        else:
+            legacy = self.input_details.get('quantization', (0.0, 0))
+            if legacy[0] != 0.0:
+                self.input_scale = legacy[0]
+                self.input_zp = legacy[1]
+        self.input_dtype = self.input_details['dtype']
+        
+        # Input quantization parameters (for INT8 models)
+        self.input_scale = 1.0
+        self.input_zp = 0
+        inp_qp = self.input_details.get('quantization_parameters', {})
+        inp_scales = inp_qp.get('scales', None)
+        inp_zps = inp_qp.get('zero_points', None)
+        if inp_scales is not None and len(inp_scales) > 0:
+            self.input_scale = inp_scales[0]
+            self.input_zp = inp_zps[0] if inp_zps is not None and len(inp_zps) > 0 else 0
+        else:
+            legacy = self.input_details.get('quantization', (0.0, 0))
+            if legacy[0] != 0.0:
+                self.input_scale = legacy[0]
+                self.input_zp = legacy[1]
         
         # Map outputs by shape: [1,1] = scores, [1,63] = landmarks
         self.handedness_idx = None
@@ -914,10 +964,17 @@ class HandLandmarkDetector:
         if hand_crop_bgr is None or hand_crop_bgr.size == 0:
             return 0.0, None, 0.0
         
-        # Preprocess: resize, BGR->RGB, normalize to [-1, 1]
+        # Preprocess: resize, BGR->RGB, dtype-aware normalization
         img = cv2.resize(hand_crop_bgr, (self.input_w, self.input_h))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = (img.astype(np.float32) - 128.0) / 128.0
+        
+        if self.input_dtype == np.int8:
+            img = (img.astype(np.float32) - 128.0) / 128.0  # normalize to [-1, 1]
+            img = np.clip(img / self.input_scale + self.input_zp, -128, 127).astype(np.int8)
+        elif self.input_dtype == np.uint8:
+            img = img.astype(np.uint8)
+        else:
+            img = (img.astype(np.float32) - 128.0) / 128.0
         img = np.expand_dims(img, axis=0)
         
         self.interpreter.set_tensor(self.input_details['index'], img)
