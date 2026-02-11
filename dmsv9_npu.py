@@ -140,6 +140,15 @@ def load_npu_model(model_path):
     return interpreter
 
 
+def load_cpu_model(model_path):
+    """Load a TFLite model on CPU only (no NPU/Vela).
+    Used for models where Vela compilation destroys regression accuracy."""
+    interpreter = tflite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+    print(f"[CPU] Loaded {model_path} on CPU (no Vela)")
+    return interpreter
+
+
 # ============================================================
 # Face Landmark Model Wrapper (replaces MediaPipe FaceMesh)
 # ============================================================
@@ -855,8 +864,9 @@ class PalmDetector:
 
 class HandLandmarkDetector:
     """
-    Hand Landmark detector using hand_landmark_ptq_vela.tflite
-    Input:  [1, 224, 224, 3] — float32 I/O, INT8 internal (PTQ)
+    Hand Landmark detector using hand_landmark_ptq.tflite on CPU.
+    Vela compilation destroys landmark regression — runs on CPU instead.
+    Input:  [1, 224, 224, 3] — float32
     Output0: [1, 1]  — score (presence or handedness)
     Output1: [1, 63] — 21 landmarks × 3 (x, y, z)
     Output2: [1, 1]  — score (presence or handedness)
@@ -871,8 +881,9 @@ class HandLandmarkDetector:
     RING_TIP = 16
     PINKY_TIP = 20
     
-    def __init__(self, model_path="hand_landmark_ptq_vela.tflite"):
-        self.interpreter = load_npu_model(model_path)
+    def __init__(self, model_path="hand_landmark_ptq.tflite"):
+        # Use CPU-only loader — Vela destroys landmark regression accuracy
+        self.interpreter = load_cpu_model(model_path)
         
         self.input_details = self.interpreter.get_input_details()[0]
         self.output_details = self.interpreter.get_output_details()
@@ -1151,9 +1162,9 @@ parser.add_argument('--iris_landmark_model', type=str, default='iris_landmark_pt
 parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face confidence threshold from landmark model")
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_ptq_vela.tflite')
-parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq_vela.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.35, help="Palm detection threshold (PTQ model has better calibrated scores)")
-parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand presence threshold (PTQ model should output real presence scores)")
+parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq.tflite')
+parser.add_argument('--palm_det_threshold', type=float, default=0.20, help="Palm detection threshold (PTQ model sigmoid scores ~0.13-0.25)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand presence threshold")
 
 args = parser.parse_args()
 
