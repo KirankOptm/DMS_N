@@ -1044,8 +1044,8 @@ parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_full_quant_vela.tflite')
 parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_full_quant_vela.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.50, help="Palm detection confidence threshold (MediaPipe default=0.5)")
-parser.add_argument('--hand_presence_threshold', type=float, default=0.6, help="Hand landmark presence threshold (0.5=noise, 0.6+=real hand)")
+parser.add_argument('--palm_det_threshold', type=float, default=0.25, help="Palm detection threshold (INT8 model scores 0.27-0.34 for real hands, HandLM acts as 2nd-stage filter)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand landmark presence threshold (0.5=noise, 0.55+=real hand)")
 
 args = parser.parse_args()
 
@@ -1375,6 +1375,7 @@ cached_palm_boxes = []
 cached_hand_landmarks_list = []  # list of (hand_lm_list, handedness) tuples
 hand_lost_count = 0
 MAX_HAND_LOST = 2  # clear cache after N palm-detection cycles without detection
+handlm_diag_count = 0  # diagnostic counter for first N HandLM inferences
 
 # Hand alert confirmation (prevent random single-frame false positives)
 HAND_CONFIRM_FRAMES = 5  # require N consecutive frames with hand detected before alerting
@@ -1586,8 +1587,12 @@ while cap.isOpened():
             hand_crop = frame[py1:py2, px1:px2]
             if hand_crop is not None and hand_crop.size > 0:
                 presence, hand_lms, handedness = hand_landmark_detector.predict(hand_crop)
-                if fid % 30 == 0:
-                    print(f"[HandLM] palm=({px1},{py1})-({px2},{py2}) presence={presence:.3f} has_lms={hand_lms is not None}")
+                handlm_diag_count += 1
+                # Always log first 50 HandLM inferences + every 30th frame thereafter
+                if handlm_diag_count <= 50 or fid % 30 == 0:
+                    print(f"[HandLM#{handlm_diag_count}] palm=({px1},{py1})-({px2},{py2}) sz={px2-px1}x{py2-py1} "
+                          f"presence={presence:.4f} handedness={handedness:.3f} has_lms={hand_lms is not None} "
+                          f"thresh={args.hand_presence_threshold} pass={'YES' if presence > args.hand_presence_threshold else 'NO'}")
                 if hand_lms is not None and presence > args.hand_presence_threshold:
                     # Convert hand landmarks from crop-relative to frame coords (normalized 0-1)
                     crop_w_px = px2 - px1
