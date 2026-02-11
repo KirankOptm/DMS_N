@@ -1044,8 +1044,8 @@ parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
 parser.add_argument('--palm_detection_model', type=str, default='palm_detection_full_quant_vela.tflite')
 parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_full_quant_vela.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.30, help="Palm detection confidence threshold (NPU model outputs low scores, hand landmark model acts as 2nd-stage filter)")
-parser.add_argument('--hand_presence_threshold', type=float, default=0.5, help="Hand landmark presence threshold")
+parser.add_argument('--palm_det_threshold', type=float, default=0.50, help="Palm detection confidence threshold (MediaPipe default=0.5)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.6, help="Hand landmark presence threshold (0.5=noise, 0.6+=real hand)")
 
 args = parser.parse_args()
 
@@ -1374,7 +1374,7 @@ PALM_SKIP_FRAMES = 3  # run palm detection every 3rd frame
 cached_palm_boxes = []
 cached_hand_landmarks_list = []  # list of (hand_lm_list, handedness) tuples
 hand_lost_count = 0
-MAX_HAND_LOST = 5  # clear cache after N frames without detection
+MAX_HAND_LOST = 2  # clear cache after N palm-detection cycles without detection
 
 # Hand alert confirmation (prevent random single-frame false positives)
 HAND_CONFIRM_FRAMES = 5  # require N consecutive frames with hand detected before alerting
@@ -1603,8 +1603,11 @@ while cap.isOpened():
         if len(new_hand_lm_list) > 0:
             cached_hand_landmarks_list = new_hand_lm_list
         else:
-            # Hand landmark model rejected all crops — clear cache
+            # Hand landmark model rejected ALL crops — clear both caches
+            # This prevents stale palm boxes from retrying HandLM every frame
             cached_hand_landmarks_list = []
+            cached_palm_boxes = []
+            hand_lost_count = 0
         detected_hands = cached_hand_landmarks_list
     
     # FPS calculation
