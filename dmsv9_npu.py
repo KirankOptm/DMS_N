@@ -89,8 +89,32 @@ class MJPEGServer:
 
 
 # ============================================================
-# NPU TFLite Model Loader
+# NPU TFLite Model Loader + Dequantization Helper
 # ============================================================
+
+def dequantize_tensor(interpreter, tensor_index, output_detail):
+    """
+    Get a tensor from the interpreter and dequantize if needed.
+    For INT8/UINT8 quantized outputs: float = (int_val - zero_point) * scale
+    For float32 outputs: returns as-is.
+    """
+    raw = interpreter.get_tensor(tensor_index)
+    if raw.dtype == np.float32:
+        return raw
+    # INT8 or UINT8 — need manual dequantization
+    qp = output_detail.get('quantization_parameters', {})
+    scales = qp.get('scales', None)
+    zero_points = qp.get('zero_points', None)
+    if scales is not None and len(scales) > 0:
+        scale = scales[0]
+        zp = zero_points[0] if zero_points is not None and len(zero_points) > 0 else 0
+    else:
+        # Fallback to legacy 'quantization' tuple (scale, zero_point)
+        legacy = output_detail.get('quantization', (0.0, 0))
+        scale = legacy[0] if legacy[0] != 0.0 else 1.0
+        zp = legacy[1]
+    return (raw.astype(np.float32) - zp) * scale
+
 
 def load_npu_model(model_path):
     """Load a Vela-compiled TFLite model on the Ethos-U NPU"""
@@ -591,6 +615,347 @@ class BlazeFaceDetector:
 
 
 # ============================================================
+# Palm Detector (NPU) — replaces MediaPipe Hands detection stage
+# Uses same SSD anchor pattern as BlazeFace but 192×192 input
+# ============================================================
+
+class PalmDetector:
+    """
+    Palm detector using palm_detection_full_quant_vela.tflite
+    Input:  [1, 192, 192, 3] float32 normalized to [-1, 1]
+    Output0: scores [1, 2016, 1]
+    Output1: boxes [1, 2016, 18]  (center_x, center_y, w, h + 7 keypoints × 2)
+    """
+    
+    def __init__(self, model_path="palm_detection_full_quant_vela.tflite", threshold=0.6):
+        self.interpreter = load_npu_model(model_path)
+        
+        self.input_details = self.interpreter.get_input_details()[0]
+        self.output_details = self.interpreter.get_output_details()
+        
+        self.input_shape = self.input_details['shape']  # [1, 192, 192, 3]
+        self.input_h = self.input_shape[1]
+        self.input_w = self.input_shape[2]
+        
+        # Auto-detect score vs box outputs by shape (not position)
+        # Scores: last dim = 1, Boxes: last dim = 18 (cx, cy, w, h + 7 keypoints × 2)
+        self.score_index = None
+        self.bbox_index = None
+        self.score_detail = None
+        self.bbox_detail = None
+        for i, od in enumerate(self.output_details):
+            last_dim = od['shape'][-1]
+            if last_dim == 1:
+                self.score_index = od['index']
+                self.score_detail = od
+                print(f"[PalmDet] Output {i} → SCORES (shape={od['shape']}, dtype={od['dtype']})")
+            elif last_dim == 18:
+                self.bbox_index = od['index']
+                self.bbox_detail = od
+                print(f"[PalmDet] Output {i} → BOXES (shape={od['shape']}, dtype={od['dtype']})")
+            else:
+                print(f"[PalmDet] Output {i} → UNKNOWN (shape={od['shape']})")
+        
+        # Fallback if shapes don't match expected pattern
+        if self.score_index is None or self.bbox_index is None:
+            print(f"[PalmDet] WARNING: Could not auto-detect outputs, using positional fallback")
+            self.score_index = self.output_details[0]['index']
+            self.bbox_index = self.output_details[1]['index']
+            self.score_detail = self.output_details[0]
+            self.bbox_detail = self.output_details[1]
+        
+        # SSD anchors — same pattern as BlazeFace, different input size
+        # 192/8=24 → 24×24×2=1152, 192/16=12 → 12×12×6=864, total=2016
+        self.ssd_opts = {
+            'num_layers': 4,
+            'input_size_height': self.input_h,
+            'input_size_width': self.input_w,
+            'anchor_offset_x': 0.5,
+            'anchor_offset_y': 0.5,
+            'strides': [8, 16, 16, 16],
+            'interpolated_scale_aspect_ratio': 1.0,
+        }
+        
+        self.anchors = self._ssd_generate_anchors(self.ssd_opts)
+        self.threshold = threshold
+        
+        print(f"[PalmDet] Input: {self.input_shape}, anchors: {len(self.anchors)}")
+        for i, od in enumerate(self.output_details):
+            print(f"[PalmDet] Output {i}: {od['shape']}, name={od['name']}")
+    
+    def _ssd_generate_anchors(self, opts):
+        """Generate SSD anchors — same algorithm as BlazeFace"""
+        layer_id = 0
+        num_layers = opts['num_layers']
+        strides = opts['strides']
+        input_height = opts['input_size_height']
+        input_width = opts['input_size_width']
+        anchor_offset_x = opts['anchor_offset_x']
+        anchor_offset_y = opts['anchor_offset_y']
+        interpolated_scale_aspect_ratio = opts['interpolated_scale_aspect_ratio']
+        
+        anchors = []
+        while layer_id < num_layers:
+            last_same_stride_layer = layer_id
+            repeats = 0
+            while (last_same_stride_layer < num_layers
+                   and strides[last_same_stride_layer] == strides[layer_id]):
+                last_same_stride_layer += 1
+                repeats += 2 if interpolated_scale_aspect_ratio == 1.0 else 1
+            
+            stride = strides[layer_id]
+            feature_map_height = input_height // stride
+            feature_map_width = input_width // stride
+            
+            for y in range(feature_map_height):
+                y_center = (y + anchor_offset_y) / feature_map_height
+                for x in range(feature_map_width):
+                    x_center = (x + anchor_offset_x) / feature_map_width
+                    for _ in range(repeats):
+                        anchors.append((x_center, y_center))
+            
+            layer_id = last_same_stride_layer
+        
+        return np.array(anchors, dtype=np.float32)
+    
+    def _decode_boxes(self, raw_boxes):
+        """Decode palm detection boxes — same as BlazeFace"""
+        scale = self.input_shape[1]
+        num_points = raw_boxes.shape[-1] // 2
+        boxes = raw_boxes.reshape(-1, num_points, 2) / scale
+        boxes[:, 0] += self.anchors
+        for i in range(2, num_points):
+            boxes[:, i] += self.anchors
+        center = np.array(boxes[:, 0])
+        half_size = boxes[:, 1] / 2
+        boxes[:, 0] = center - half_size
+        boxes[:, 1] = center + half_size
+        boxes = boxes[:, 0:2, :].reshape(-1, 4)
+        return boxes
+    
+    def detect(self, frame, conf_threshold=None, max_hands=2):
+        """
+        Detect palms in frame.
+        Returns: list of (x1, y1, x2, y2) in pixel coords, up to max_hands
+        """
+        if conf_threshold is None:
+            conf_threshold = self.threshold
+        
+        h, w = frame.shape[:2]
+        
+        img = cv2.resize(frame, (self.input_w, self.input_h))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = (img.astype(np.float32) - 128.0) / 128.0
+        img = np.expand_dims(img, axis=0)
+        
+        self.interpreter.set_tensor(self.input_details['index'], img)
+        self.interpreter.invoke()
+        
+        # Dequantize outputs — critical for INT8 quantized models
+        raw_scores = dequantize_tensor(self.interpreter, self.score_index, self.score_detail)
+        raw_boxes = dequantize_tensor(self.interpreter, self.bbox_index, self.bbox_detail)
+        
+        # Debug: print raw score stats periodically
+        if hasattr(self, '_debug_count'):
+            self._debug_count += 1
+        else:
+            self._debug_count = 0
+        if self._debug_count % 30 == 0:
+            sr = raw_scores.flatten()
+            print(f"[PalmDet] score_shape={raw_scores.shape}, box_shape={raw_boxes.shape}")
+            print(f"[PalmDet] raw_scores: min={sr.min():.3f}, max={sr.max():.3f}, mean={sr.mean():.3f}")
+            sig_max = 1.0 / (1.0 + np.exp(-np.clip(sr.max(), -20, 20)))
+            print(f"[PalmDet] sigmoid(max_score)={sig_max:.4f}, threshold={conf_threshold}")
+            # Show dequant info once
+            if self._debug_count == 0:
+                raw_int = self.interpreter.get_tensor(self.score_index)
+                print(f"[PalmDet] score tensor dtype={raw_int.dtype}, "
+                      f"quant_params={self.score_detail.get('quantization_parameters', 'N/A')}")
+                raw_int_b = self.interpreter.get_tensor(self.bbox_index)
+                print(f"[PalmDet] box tensor dtype={raw_int_b.dtype}, "
+                      f"quant_params={self.bbox_detail.get('quantization_parameters', 'N/A')}")
+        
+        boxes = self._decode_boxes(raw_boxes)
+        scores_raw = raw_scores.flatten()
+        scores = np.clip(scores_raw, -RAW_SCORE_LIMIT, RAW_SCORE_LIMIT)
+        scores = 1.0 / (1.0 + np.exp(-scores))
+        
+        # Filter by threshold
+        mask = scores > conf_threshold
+        if not np.any(mask):
+            return []
+        
+        filtered_boxes = boxes[mask]
+        filtered_scores = scores[mask]
+        
+        # NMS
+        candidates = sorted(zip(filtered_boxes, filtered_scores), key=lambda x: x[1], reverse=True)
+        kept = []
+        for box, score in candidates:
+            suppressed = False
+            for k in kept:
+                # IoU check
+                x1i = max(box[0], k[0]); y1i = max(box[1], k[1])
+                x2i = min(box[2], k[2]); y2i = min(box[3], k[3])
+                inter = max(0, x2i - x1i) * max(0, y2i - y1i)
+                a1 = (box[2]-box[0])*(box[3]-box[1])
+                a2 = (k[2]-k[0])*(k[3]-k[1])
+                iou = inter / (a1 + a2 - inter) if (a1 + a2 - inter) > 0 else 0
+                if iou > MIN_SUPPRESSION_THRESHOLD:
+                    suppressed = True
+                    break
+            if not suppressed:
+                kept.append(box)
+                if len(kept) >= max_hands:
+                    break
+        
+        # Convert to pixel coords with margin for hand landmark crop
+        results = []
+        for box in kept:
+            bx1 = int(np.clip(box[0], 0, 1) * w)
+            by1 = int(np.clip(box[1], 0, 1) * h)
+            bx2 = int(np.clip(box[2], 0, 1) * w)
+            by2 = int(np.clip(box[3], 0, 1) * h)
+            # Add 20% margin for hand landmark model
+            bw = bx2 - bx1
+            bh = by2 - by1
+            mx = int(bw * 0.2)
+            my = int(bh * 0.2)
+            bx1 = max(0, bx1 - mx)
+            by1 = max(0, by1 - my)
+            bx2 = min(w, bx2 + mx)
+            by2 = min(h, by2 + my)
+            if (bx2 - bx1) > 15 and (by2 - by1) > 15:
+                results.append((bx1, by1, bx2, by2))
+        
+        return results
+
+
+# ============================================================
+# Hand Landmark Detector (NPU) — replaces MediaPipe Hands landmark stage
+# ============================================================
+
+class HandLandmarkDetector:
+    """
+    Hand Landmark detector using hand_landmark_full_quant_vela.tflite
+    Input:  [1, 224, 224, 3] float32 normalized to [-1, 1]
+    Output0: [1, 1]  — handedness score (>0.5 = right hand)
+    Output1: [1, 63] — 21 landmarks × 3 (x, y, z)
+    Output2: [1, 1]  — hand presence/confidence
+    Output3: [1, 63] — world landmarks (3D in meters)
+    """
+    
+    # 21 MediaPipe hand landmark names for reference
+    WRIST = 0
+    THUMB_TIP = 4
+    INDEX_TIP = 8
+    MIDDLE_TIP = 12
+    RING_TIP = 16
+    PINKY_TIP = 20
+    
+    def __init__(self, model_path="hand_landmark_full_quant_vela.tflite"):
+        self.interpreter = load_npu_model(model_path)
+        
+        self.input_details = self.interpreter.get_input_details()[0]
+        self.output_details = self.interpreter.get_output_details()
+        
+        self.input_shape = self.input_details['shape']  # [1, 224, 224, 3]
+        self.input_h = self.input_shape[1]
+        self.input_w = self.input_shape[2]
+        
+        # Map outputs by shape: [1,1] = scores, [1,63] = landmarks
+        self.handedness_idx = None
+        self.landmark_idx = None
+        self.presence_idx = None
+        self.world_lm_idx = None
+        # Store full output details for dequantization
+        self.handedness_detail = None
+        self.landmark_detail = None
+        self.presence_detail = None
+        self.world_lm_detail = None
+        
+        score_indices = []
+        lm_indices = []
+        for i, od in enumerate(self.output_details):
+            shape = tuple(od['shape'])
+            if shape == (1, 1):
+                score_indices.append(i)
+            elif shape == (1, 63):
+                lm_indices.append(i)
+        
+        # Assign based on typical MediaPipe output order
+        if len(score_indices) >= 2:
+            self.handedness_idx = self.output_details[score_indices[0]]['index']
+            self.handedness_detail = self.output_details[score_indices[0]]
+            self.presence_idx = self.output_details[score_indices[1]]['index']
+            self.presence_detail = self.output_details[score_indices[1]]
+        if len(lm_indices) >= 2:
+            self.landmark_idx = self.output_details[lm_indices[0]]['index']
+            self.landmark_detail = self.output_details[lm_indices[0]]
+            self.world_lm_idx = self.output_details[lm_indices[1]]['index']
+            self.world_lm_detail = self.output_details[lm_indices[1]]
+        
+        print(f"[HandLandmark] Input: {self.input_shape}, dtype={self.input_details['dtype']}")
+        for i, od in enumerate(self.output_details):
+            print(f"[HandLandmark] Output {i}: {od['shape']}, dtype={od['dtype']}, name={od['name']}")
+    
+    def predict(self, hand_crop_bgr):
+        """
+        Run hand landmark inference on a cropped palm region.
+        
+        Args:
+            hand_crop_bgr: BGR hand crop (any size, will be resized to 224×224)
+        
+        Returns:
+            presence: float (0-1) hand presence confidence
+            landmarks: list of 21 LandmarkPoint objects (normalized 0-1 relative to crop)
+            handedness: float (>0.5 = right hand)
+        """
+        if hand_crop_bgr is None or hand_crop_bgr.size == 0:
+            return 0.0, None, 0.0
+        
+        # Preprocess: resize, BGR->RGB, normalize to [-1, 1]
+        img = cv2.resize(hand_crop_bgr, (self.input_w, self.input_h))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = (img.astype(np.float32) - 128.0) / 128.0
+        img = np.expand_dims(img, axis=0)
+        
+        self.interpreter.set_tensor(self.input_details['index'], img)
+        self.interpreter.invoke()
+        
+        # Parse outputs — dequantize INT8 if needed
+        presence = 0.0
+        handedness = 0.0
+        if self.presence_idx is not None:
+            raw_presence = float(dequantize_tensor(
+                self.interpreter, self.presence_idx, self.presence_detail).flatten()[0])
+            presence = 1.0 / (1.0 + np.exp(-raw_presence))  # sigmoid
+        if self.handedness_idx is not None:
+            raw_hand = float(dequantize_tensor(
+                self.interpreter, self.handedness_idx, self.handedness_detail).flatten()[0])
+            handedness = 1.0 / (1.0 + np.exp(-raw_hand))  # sigmoid
+        
+        if self.landmark_idx is None:
+            return presence, None, handedness
+        
+        raw_lm = dequantize_tensor(
+            self.interpreter, self.landmark_idx, self.landmark_detail).flatten().astype(np.float32)
+        if raw_lm.size < 63:
+            return presence, None, handedness
+        
+        # Reshape to [21, 3], normalize to 0-1
+        lm = raw_lm[:63].reshape(21, 3)
+        lm[:, 0] /= self.input_w
+        lm[:, 1] /= self.input_h
+        lm[:, 2] /= self.input_w
+        
+        # Create LandmarkPoint list
+        hand_landmarks = [LandmarkPoint(lm[i, 0], lm[i, 1], lm[i, 2]) for i in range(21)]
+        
+        return presence, hand_landmarks, handedness
+
+
+# ============================================================
 # Landmark Adapter: converts raw landmarks to pixel coordinates
 # Mimics MediaPipe landmark interface for compatibility
 # ============================================================
@@ -677,6 +1042,10 @@ parser.add_argument('--face_landmark_model', type=str, default='face_landmark_pt
 parser.add_argument('--iris_landmark_model', type=str, default='iris_landmark_ptq_vela.tflite')
 parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face confidence threshold from landmark model")
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
+parser.add_argument('--palm_detection_model', type=str, default='palm_detection_full_quant_vela.tflite')
+parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_full_quant_vela.tflite')
+parser.add_argument('--palm_det_threshold', type=float, default=0.30, help="Palm detection confidence threshold (NPU model outputs low scores, hand landmark model acts as 2nd-stage filter)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.5, help="Hand landmark presence threshold")
 
 args = parser.parse_args()
 
@@ -688,7 +1057,9 @@ print("[DMS] Loading NPU models...")
 face_detector = BlazeFaceDetector(args.face_detection_model)
 face_landmark_detector = FaceLandmarkDetector(args.face_landmark_model)
 iris_landmark_detector = IrisLandmarkDetector(args.iris_landmark_model)
-print("[DMS] All 3 models loaded on NPU")
+palm_detector = PalmDetector(args.palm_detection_model, threshold=args.palm_det_threshold)
+hand_landmark_detector = HandLandmarkDetector(args.hand_landmark_model)
+print("[DMS] All 5 models loaded on NPU (face_det + face_lm + iris + palm_det + hand_lm)")
 
 # MediaPipe landmark indices (same as original dmsv8.py)
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
@@ -852,6 +1223,68 @@ def get_iris_center_from_landmarks(landmarks, indices, w, h):
     return np.mean(points, axis=0)
 
 
+def hand_near_ear(face_landmarks, hand_lm_list, w, h):
+    """
+    Check if hand fingertips are near ear landmarks.
+    Matches ref: asymmetric thresholds for right-side 45° camera.
+    Uses face-height-relative radii + nose Y filtering.
+    """
+    try:
+        xs = [lm.x * w for lm in face_landmarks]
+        ys = [lm.y * h for lm in face_landmarks]
+        face_h = max(1.0, float(max(ys) - min(ys)))
+    except Exception:
+        face_h = float(h)
+
+    # Nose landmark as divider (landmark index 1 in 468-point mesh)
+    try:
+        nose_y = face_landmarks[1].y * h
+    except Exception:
+        nose_y = h * 0.5
+
+    ear_l = np.array([face_landmarks[LEFT_EAR_TIP].x * w, face_landmarks[LEFT_EAR_TIP].y * h])
+    ear_r = np.array([face_landmarks[RIGHT_EAR_TIP].x * w, face_landmarks[RIGHT_EAR_TIP].y * h])
+    tips = [4, 8, 12, 16, 20]  # fingertip landmark indices in hand model
+
+    # Asymmetric radius for right-side 45° camera (matches ref)
+    r_pix_right = 0.20 * face_h  # right ear (closer to camera)
+    r_pix_left  = 0.60 * face_h  # left ear (farther, perspective distortion)
+
+    # Nose filter boundary — only consider fingertips above nose level
+    nose_filter_right = nose_y + (0.12 * face_h)
+    nose_filter_left  = nose_y + (0.15 * face_h)
+
+    near_l = 0
+    near_r = 0
+    for idx in tips:
+        if idx >= len(hand_lm_list):
+            continue
+        lm = hand_lm_list[idx]
+        hx, hy = lm.x * w, lm.y * h
+
+        # Right ear check (with nose filtering)
+        if hy <= nose_filter_right:
+            if np.hypot(hx - ear_r[0], hy - ear_r[1]) <= r_pix_right:
+                near_r += 1
+
+        # Left ear check (with nose filtering)
+        if hy <= nose_filter_left:
+            if np.hypot(hx - ear_l[0], hy - ear_l[1]) <= r_pix_left:
+                near_l += 1
+
+    return (near_l >= 1) or (near_r >= 1)
+
+
+def hand_near_face(face_center, hand_lm_list, w, h, threshold_px=200):
+    """Check if any hand landmark is near face center (matches dmsv8 exactly)"""
+    fcx, fcy = face_center
+    for lm in hand_lm_list:
+        x, y = int(lm.x * w), int(lm.y * h)
+        if np.hypot(fcx - x, fcy - y) < threshold_px:
+            return True
+    return False
+
+
 eye_closed = 0
 head_turn = 0
 hands_free = False
@@ -879,6 +1312,75 @@ BOX_SMOOTH_ALPHA = 0.4  # 0.4 = responsive yet stable (lower = smoother but lagg
 # Landmark EMA smoothing (MediaPipe does this internally via its FilterStabilizer)
 smoothed_landmarks = None  # numpy [468, 3]
 LM_SMOOTH_ALPHA = 0.5     # 0.5 = balanced (MediaPipe uses ~0.3-0.5 equivalent)
+
+# ---- MediaPipe-style hand landmark drawing ----
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),           # thumb
+    (0,5),(5,6),(6,7),(7,8),           # index
+    (5,9),(9,10),(10,11),(11,12),      # middle
+    (9,13),(13,14),(14,15),(15,16),    # ring
+    (13,17),(17,18),(18,19),(19,20),   # pinky
+    (0,17),                            # palm base
+]
+# Finger color groups (BGR): matches MediaPipe visualization
+HAND_FINGER_COLORS = {
+    'thumb':  (48, 48, 255),    # red
+    'index':  (48, 255, 48),    # green
+    'middle': (255, 187, 0),    # blue-ish
+    'ring':   (0, 204, 255),    # orange
+    'pinky':  (255, 0, 204),    # pink
+    'palm':   (200, 200, 200),  # gray
+}
+# Map each landmark index to its finger group
+LM_TO_FINGER = {}
+for i in range(5):  LM_TO_FINGER[i] = 'thumb'
+for i in range(5,9):  LM_TO_FINGER[i] = 'index'
+for i in range(9,13):  LM_TO_FINGER[i] = 'middle'
+for i in range(13,17): LM_TO_FINGER[i] = 'ring'
+for i in range(17,21): LM_TO_FINGER[i] = 'pinky'
+# Map each connection to a color
+CONN_COLORS = []
+for (a, b) in HAND_CONNECTIONS:
+    if a == 0 and b in (5, 17):  # palm base connections
+        CONN_COLORS.append(HAND_FINGER_COLORS['palm'])
+    elif 5 == a and b == 9:
+        CONN_COLORS.append(HAND_FINGER_COLORS['palm'])
+    elif 9 == a and b == 13:
+        CONN_COLORS.append(HAND_FINGER_COLORS['palm'])
+    elif 13 == a and b == 17:
+        CONN_COLORS.append(HAND_FINGER_COLORS['palm'])
+    else:
+        CONN_COLORS.append(HAND_FINGER_COLORS.get(LM_TO_FINGER.get(b, 'palm'), (200,200,200)))
+
+def draw_hand_landmarks_mp(frame, hand_lm_list, w, h):
+    """Draw hand landmarks MediaPipe-style: connections + colored joints."""
+    pts = []
+    for lm in hand_lm_list:
+        pts.append((int(lm.x * w), int(lm.y * h)))
+    # Draw connections first (behind joints)
+    for idx, (a, b) in enumerate(HAND_CONNECTIONS):
+        if a < len(pts) and b < len(pts):
+            cv2.line(frame, pts[a], pts[b], CONN_COLORS[idx], 2, cv2.LINE_AA)
+    # Draw joint circles on top
+    for i, pt in enumerate(pts):
+        finger = LM_TO_FINGER.get(i, 'palm')
+        color = HAND_FINGER_COLORS[finger]
+        radius = 5 if i in (0, 4, 8, 12, 16, 20) else 3  # larger for wrist + fingertips
+        cv2.circle(frame, pt, radius, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, pt, radius, (255, 255, 255), 1, cv2.LINE_AA)  # white border
+
+# Hand detection frame-skipping (palm det = 13.57ms, expensive)
+PALM_SKIP_FRAMES = 3  # run palm detection every 3rd frame
+cached_palm_boxes = []
+cached_hand_landmarks_list = []  # list of (hand_lm_list, handedness) tuples
+hand_lost_count = 0
+MAX_HAND_LOST = 5  # clear cache after N frames without detection
+
+# Hand alert confirmation (prevent random single-frame false positives)
+HAND_CONFIRM_FRAMES = 5  # require N consecutive frames with hand detected before alerting
+hand_near_ear_streak = 0
+hand_near_face_streak = 0
+texting_streak = 0
 
 while cap.isOpened():
     frame_start = time.time()
@@ -1012,6 +1514,99 @@ while cap.isOpened():
             left_eye_contour = cached_left_eye_contour
             right_eye_contour = cached_right_eye_contour
     
+    # ---- STEP 4: Hand detection via Palm Detector + Hand Landmark NPU ----
+    detected_hands = []  # list of (hand_lm_list_in_frame_coords, handedness)
+    
+    run_palm_this_frame = (fid % PALM_SKIP_FRAMES == 0)
+    
+    if run_palm_this_frame:
+        palm_boxes = palm_detector.detect(frame, max_hands=2)
+        
+        if fid % 30 == 0:
+            print(f"[Palm] Raw detections: {len(palm_boxes)} boxes")
+            for i, (px1, py1, px2, py2) in enumerate(palm_boxes):
+                print(f"  palm[{i}]: ({px1},{py1})-({px2},{py2}) size={px2-px1}x{py2-py1}")
+        
+        # Filter out false-positive palm boxes:
+        # 1. Face detected as palm (centered on face + similar size)
+        # 2. Body/chest detected as palm (far below face)
+        if face_box is not None and len(palm_boxes) > 0:
+            fx1, fy1, fx2, fy2 = face_box
+            face_w = fx2 - fx1
+            face_h = fy2 - fy1
+            face_area = max(1, face_w * face_h)
+            face_cx = (fx1 + fx2) / 2
+            face_cy = (fy1 + fy2) / 2
+            face_bottom = fy2
+            filtered_palms = []
+            for px1, py1, px2, py2 in palm_boxes:
+                palm_cx = (px1 + px2) / 2
+                palm_cy = (py1 + py2) / 2
+                palm_area = max(1, (px2 - px1) * (py2 - py1))
+                
+                # FILTER 1: Face-as-palm (centered on face + similar size)
+                cdx = abs(palm_cx - face_cx) / max(1, face_w)
+                cdy = abs(palm_cy - face_cy) / max(1, face_h)
+                size_ratio = palm_area / face_area
+                is_centered = cdx < 0.25 and cdy < 0.25
+                is_similar_size = 0.5 < size_ratio < 2.0
+                if is_centered and is_similar_size:
+                    if fid % 30 == 0:
+                        print(f"[Palm] Rejected face-as-palm (cdist=({cdx:.2f},{cdy:.2f}), size_ratio={size_ratio:.2f})")
+                    continue
+                
+                # FILTER 2: Body/chest region — reject palms far below face
+                # Real hands near face/ear will be at face level or slightly below
+                # Body detections are >1.5 face heights below face bottom edge
+                below_face_dist = (palm_cy - face_bottom) / max(1, face_h)
+                if below_face_dist > 1.0:
+                    if fid % 30 == 0:
+                        print(f"[Palm] Rejected body-region ({below_face_dist:.2f}x face_h below face)")
+                    continue
+                
+                filtered_palms.append((px1, py1, px2, py2))
+            palm_boxes = filtered_palms
+            if fid % 30 == 0:
+                print(f"[Palm] After filter: {len(palm_boxes)} boxes")
+        
+        if len(palm_boxes) > 0:
+            cached_palm_boxes = palm_boxes
+            hand_lost_count = 0
+        else:
+            hand_lost_count += 1
+            if hand_lost_count > MAX_HAND_LOST:
+                cached_palm_boxes = []
+                cached_hand_landmarks_list = []
+    
+    # Run hand landmark on detected palms (every frame if palm cached)
+    if len(cached_palm_boxes) > 0:
+        new_hand_lm_list = []
+        for palm_box in cached_palm_boxes:
+            px1, py1, px2, py2 = palm_box
+            hand_crop = frame[py1:py2, px1:px2]
+            if hand_crop is not None and hand_crop.size > 0:
+                presence, hand_lms, handedness = hand_landmark_detector.predict(hand_crop)
+                if fid % 30 == 0:
+                    print(f"[HandLM] palm=({px1},{py1})-({px2},{py2}) presence={presence:.3f} has_lms={hand_lms is not None}")
+                if hand_lms is not None and presence > args.hand_presence_threshold:
+                    # Convert hand landmarks from crop-relative to frame coords (normalized 0-1)
+                    crop_w_px = px2 - px1
+                    crop_h_px = py2 - py1
+                    frame_hand_lms = []
+                    for lm in hand_lms:
+                        fx = (px1 + lm.x * crop_w_px) / w
+                        fy = (py1 + lm.y * crop_h_px) / h
+                        fz = lm.z
+                        frame_hand_lms.append(LandmarkPoint(fx, fy, fz))
+                    new_hand_lm_list.append((frame_hand_lms, handedness))
+        
+        if len(new_hand_lm_list) > 0:
+            cached_hand_landmarks_list = new_hand_lm_list
+        else:
+            # Hand landmark model rejected all crops — clear cache
+            cached_hand_landmarks_list = []
+        detected_hands = cached_hand_landmarks_list
+    
     # FPS calculation
     frame_end = time.time()
     frame_ms = (frame_end - frame_start) * 1000
@@ -1025,7 +1620,8 @@ while cap.isOpened():
     # Log detection status every 30 frames
     if fid % 30 == 0:
         face_status = f"Face detected (conf={face_confidence:.2f})" if landmarks else "No face"
-        print(f"[Frame {fid}] {face_status} | FPS: {fps:.1f} | Frame: {frame_ms:.1f}ms")
+        hand_status = f"{len(detected_hands)} hand(s)" if detected_hands else "No hand"
+        print(f"[Frame {fid}] {face_status}, {hand_status} | FPS: {fps:.1f} | Frame: {frame_ms:.1f}ms")
 
     # ---- DMS LOGIC (same as original dmsv8.py) ----
     if landmarks is not None:
@@ -1252,8 +1848,80 @@ while cap.isOpened():
             if iris_right_center is not None:
                 cv2.circle(frame, (int(iris_right_center[0]), int(iris_right_center[1])), 3, (255, 0, 255), -1)
 
-    # NOTE: Hand detection removed (MediaPipe Hands removed).
-    # To re-enable, integrate a TFLite hand detection model.
+    # ---- Hand detection alerts (with confirmation streaks to prevent false positives) ----
+    frame_hand_near_ear = False
+    frame_hand_near_face = False
+    frame_texting = False
+    
+    if len(detected_hands) > 0 and landmarks is not None:
+        hand_coords = []
+        for hand_lm_list, handedness in detected_hands:
+            # Check phone call: require BOTH near ear AND near face (matches ref)
+            near_ear = hand_near_ear(landmarks, hand_lm_list, w, h)
+            near_face = hand_near_face(face_center, hand_lm_list, w, h, args.hand_near_face_px)
+            
+            if near_ear and near_face:
+                frame_hand_near_ear = True
+            elif near_face:
+                frame_hand_near_face = True
+            
+            if fid % 30 == 0:
+                hcx = np.mean([lm.x for lm in hand_lm_list])
+                hcy = np.mean([lm.y for lm in hand_lm_list])
+                print(f"[Hand] center=({hcx:.2f},{hcy:.2f}) near_ear={near_ear} near_face={near_face} handedness={handedness:.2f}")
+            
+            # Collect hand center for texting detection
+            xs = [lm.x for lm in hand_lm_list]
+            ys = [lm.y for lm in hand_lm_list]
+            hand_coords.append((np.mean(xs), np.mean(ys)))
+            
+            # Draw hand landmarks MediaPipe-style (skeleton + colored joints)
+            if not args.no_mesh_display:
+                draw_hand_landmarks_mp(frame, hand_lm_list, w, h)
+        
+        # Texting detection: 2 hands, both low, close together (matches dmsv8)
+        if not calibration_mode and len(hand_coords) == 2:
+            (x1h, y1h), (x2h, y2h) = hand_coords
+            dist = np.hypot(x2h - x1h, y2h - y1h)
+            both_hands_low = y1h > 0.6 and y2h > 0.6
+            not_near_ears = True
+            for hand_lm_list, _ in detected_hands:
+                if hand_near_ear(landmarks, hand_lm_list, w, h):
+                    not_near_ears = False
+                    break
+            if dist < 0.35 and both_hands_low and not_near_ears:
+                frame_texting = True
+    
+    # Confirmation streaks: only alert after N consecutive frames (prevents random false positives)
+    if frame_hand_near_ear:
+        hand_near_ear_streak += 1
+        if hand_near_ear_streak >= HAND_CONFIRM_FRAMES:
+            msg = "Likely mobile call"
+            msg = add_alert(frame, msg)
+            last_msg = msg
+            hands_free = True
+    else:
+        hand_near_ear_streak = 0
+    
+    if frame_hand_near_face:
+        hand_near_face_streak += 1
+        if hand_near_face_streak >= HAND_CONFIRM_FRAMES:
+            msg = "Hand near the face"
+            msg = add_alert(frame, msg)
+            last_msg = msg
+            hands_free = True
+    else:
+        hand_near_face_streak = 0
+    
+    if frame_texting:
+        texting_streak += 1
+        if texting_streak >= HAND_CONFIRM_FRAMES:
+            msg = "Possible texting observed"
+            msg = add_alert(frame, msg)
+            last_msg = msg
+            hands_free = True
+    else:
+        texting_streak = 0
 
     # Combined drowsiness detection
     if eye_closed == 2 and head_droop >= 1 or eye_closed == 2 and yawn_flag:
@@ -1262,6 +1930,12 @@ while cap.isOpened():
         last_msg = msg
     elif eye_closed == 1 and head_droop >= 1 or eye_closed == 1 and yawn_flag:
         msg = "Moderate DROWSINESS Observed"
+        msg = add_alert(frame, msg)
+        last_msg = msg
+    
+    # Combined distraction detection (matches dmsv8)
+    if head_turn >= 1 and hands_free or head_tilt >= 1 and hands_free:
+        msg = "Moderate DISTRACTION Observed"
         msg = add_alert(frame, msg)
         last_msg = msg
 
