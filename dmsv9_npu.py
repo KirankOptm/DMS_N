@@ -621,13 +621,13 @@ class BlazeFaceDetector:
 
 class PalmDetector:
     """
-    Palm detector using palm_detection_full_quant_vela.tflite
-    Input:  [1, 192, 192, 3] — dtype depends on model (int8 or float32)
+    Palm detector using palm_detection_ptq_vela.tflite
+    Input:  [1, 192, 192, 3] — float32 I/O, INT8 internal (PTQ)
     Output0: scores [1, 2016, 1]
     Output1: boxes [1, 2016, 18]  (center_x, center_y, w, h + 7 keypoints × 2)
     """
     
-    def __init__(self, model_path="palm_detection_full_quant_vela.tflite", threshold=0.6):
+    def __init__(self, model_path="palm_detection_ptq_vela.tflite", threshold=0.6):
         self.interpreter = load_npu_model(model_path)
         
         self.input_details = self.interpreter.get_input_details()[0]
@@ -855,11 +855,11 @@ class PalmDetector:
 
 class HandLandmarkDetector:
     """
-    Hand Landmark detector using hand_landmark_full_quant_vela.tflite
-    Input:  [1, 224, 224, 3] — dtype depends on model (int8 or float32)
-    Output0: [1, 1]  — handedness score (>0.5 = right hand)
+    Hand Landmark detector using hand_landmark_ptq_vela.tflite
+    Input:  [1, 224, 224, 3] — float32 I/O, INT8 internal (PTQ)
+    Output0: [1, 1]  — score (presence or handedness)
     Output1: [1, 63] — 21 landmarks × 3 (x, y, z)
-    Output2: [1, 1]  — hand presence/confidence
+    Output2: [1, 1]  — score (presence or handedness)
     Output3: [1, 63] — world landmarks (3D in meters)
     """
     
@@ -871,7 +871,7 @@ class HandLandmarkDetector:
     RING_TIP = 16
     PINKY_TIP = 20
     
-    def __init__(self, model_path="hand_landmark_full_quant_vela.tflite"):
+    def __init__(self, model_path="hand_landmark_ptq_vela.tflite"):
         self.interpreter = load_npu_model(model_path)
         
         self.input_details = self.interpreter.get_input_details()[0]
@@ -1150,10 +1150,10 @@ parser.add_argument('--face_landmark_model', type=str, default='face_landmark_pt
 parser.add_argument('--iris_landmark_model', type=str, default='iris_landmark_ptq_vela.tflite')
 parser.add_argument('--face_conf_threshold', type=float, default=0.5, help="Face confidence threshold from landmark model")
 parser.add_argument('--face_det_threshold', type=float, default=0.65, help="Face detection confidence threshold")
-parser.add_argument('--palm_detection_model', type=str, default='palm_detection_full_quant_vela.tflite')
-parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_full_quant_vela.tflite')
-parser.add_argument('--palm_det_threshold', type=float, default=0.25, help="Palm detection threshold (INT8 model scores 0.27-0.34 for real hands, HandLM acts as 2nd-stage filter)")
-parser.add_argument('--hand_presence_threshold', type=float, default=0.40, help="Hand presence threshold (model output broken=always 0.50, set below to bypass; landmark quality check filters instead)")
+parser.add_argument('--palm_detection_model', type=str, default='palm_detection_ptq_vela.tflite')
+parser.add_argument('--hand_landmark_model', type=str, default='hand_landmark_ptq_vela.tflite')
+parser.add_argument('--palm_det_threshold', type=float, default=0.35, help="Palm detection threshold (PTQ model has better calibrated scores)")
+parser.add_argument('--hand_presence_threshold', type=float, default=0.55, help="Hand presence threshold (PTQ model should output real presence scores)")
 
 args = parser.parse_args()
 
@@ -1688,20 +1688,69 @@ while cap.isOpened():
                 cached_hand_landmarks_list = []
     
     # Run hand landmark on detected palms (every frame if palm cached)
-    # NOTE: HandLM model is non-functional on NPU (all landmarks collapse to one point).
-    # Instead, use palm box position directly for hand-near-face/ear detection.
-    # Palm box center is sufficient — we don't need 21 landmarks for proximity checks.
+    # PTQ models should produce real landmarks (unlike old full_quant which collapsed).
+    # Falls back to palm box position if HandLM still fails quality check.
     detected_palm_positions = []  # list of (cx_norm, cy_norm, box_w, box_h) in normalized coords
+    detected_hands = []  # list of (hand_lm_list_in_frame_coords, handedness)
     if len(cached_palm_boxes) > 0:
+        new_hand_landmarks_list = []
         for palm_box in cached_palm_boxes:
             px1, py1, px2, py2 = palm_box
+            # Always track palm position as fallback
             cx_norm = ((px1 + px2) / 2) / w
             cy_norm = ((py1 + py2) / 2) / h
             bw = px2 - px1
             bh = py2 - py1
             detected_palm_positions.append((cx_norm, cy_norm, bw, bh))
+            
+            # Crop palm region with margin for HandLM
+            margin = 0.25
+            crop_x1 = max(0, int(px1 - bw * margin))
+            crop_y1 = max(0, int(py1 - bh * margin))
+            crop_x2 = min(w, int(px2 + bw * margin))
+            crop_y2 = min(h, int(py2 + bh * margin))
+            hand_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+            
+            if hand_crop.size == 0:
+                continue
+            
+            presence, hand_lm, handedness = hand_landmark_detector.predict(hand_crop)
+            
             if fid % 30 == 0:
-                print(f"[Palm-Direct] box=({px1},{py1})-({px2},{py2}) center=({cx_norm:.3f},{cy_norm:.3f})")
+                has_lm = hand_lm is not None
+                print(f"[HandLM] presence={presence:.3f} has_landmarks={has_lm} handedness={handedness:.3f}")
+            
+            if presence >= args.hand_presence_threshold and hand_lm is not None:
+                # Map landmarks from crop coords back to frame coords
+                crop_w = crop_x2 - crop_x1
+                crop_h = crop_y2 - crop_y1
+                frame_lm = []
+                for lp in hand_lm:
+                    fx = (lp.x * crop_w + crop_x1) / w
+                    fy = (lp.y * crop_h + crop_y1) / h
+                    frame_lm.append(LandmarkPoint(fx, fy, lp.z))
+                detected_hands.append((frame_lm, handedness))
+                new_hand_landmarks_list.append(frame_lm)
+                
+                # Draw hand landmarks on frame
+                if not args.no_mesh_display:
+                    for lp in frame_lm:
+                        lx, ly = int(lp.x * w), int(lp.y * h)
+                        cv2.circle(frame, (lx, ly), 3, (0, 255, 0), -1)  # green dots
+                    # Draw connections: wrist-to-fingertips
+                    CONNECTIONS = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+                                   (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
+                                   (13,17),(17,18),(18,19),(19,20),(0,17)]
+                    for c1, c2 in CONNECTIONS:
+                        p1 = (int(frame_lm[c1].x * w), int(frame_lm[c1].y * h))
+                        p2 = (int(frame_lm[c2].x * w), int(frame_lm[c2].y * h))
+                        cv2.line(frame, p1, p2, (0, 255, 0), 1)
+            else:
+                if fid % 30 == 0:
+                    print(f"[Palm-Direct] box=({px1},{py1})-({px2},{py2}) center=({cx_norm:.3f},{cy_norm:.3f}) [no HandLM]")
+        
+        if new_hand_landmarks_list:
+            cached_hand_landmarks_list = new_hand_landmarks_list
     
     # FPS calculation
     frame_end = time.time()
@@ -1944,12 +1993,12 @@ while cap.isOpened():
             if iris_right_center is not None:
                 cv2.circle(frame, (int(iris_right_center[0]), int(iris_right_center[1])), 3, (255, 0, 255), -1)
 
-    # ---- Hand detection alerts using PALM BOX POSITION (no HandLM needed) ----
+    # ---- Hand detection alerts using LANDMARKS (preferred) or PALM BOX (fallback) ----
     frame_hand_near_ear = False
     frame_hand_near_face = False
     frame_texting = False
     
-    if len(detected_palm_positions) > 0 and landmarks is not None and face_box is not None:
+    if (len(detected_hands) > 0 or len(detected_palm_positions) > 0) and landmarks is not None and face_box is not None:
         fx1, fy1, fx2, fy2 = face_box
         face_w_px = fx2 - fx1
         face_h_px = fy2 - fy1
@@ -1963,37 +2012,66 @@ while cap.isOpened():
         r_ear_left = 0.65 * face_h_px   # left ear (farther, perspective)
         
         hand_coords = []
-        for cx_norm, cy_norm, bw, bh in detected_palm_positions:
-            palm_cx_px = cx_norm * w
-            palm_cy_px = cy_norm * h
-            
-            # Check near ear (palm box center within ear radius)
-            dist_ear_r = np.hypot(palm_cx_px - ear_r[0], palm_cy_px - ear_r[1])
-            dist_ear_l = np.hypot(palm_cx_px - ear_l[0], palm_cy_px - ear_l[1])
-            near_ear = (dist_ear_r <= r_ear_right) or (dist_ear_l <= r_ear_left)
-            
-            # Check near face (palm center within face_h distance of face center)
-            near_face = np.hypot(palm_cx_px - face_center[0], palm_cy_px - face_center[1]) < args.hand_near_face_px
-            
-            if near_ear and near_face:
-                frame_hand_near_ear = True
-            elif near_face:
-                frame_hand_near_face = True
-            
-            hand_coords.append((cx_norm, cy_norm))
-            
-            if fid % 30 == 0:
-                print(f"[Hand] center=({cx_norm:.2f},{cy_norm:.2f}) near_ear={near_ear} near_face={near_face} "
-                      f"d_ear_r={dist_ear_r:.0f} d_ear_l={dist_ear_l:.0f}")
-            
-            # Draw palm box on frame
-            if not args.no_mesh_display:
-                px1 = int(palm_cx_px - bw/2)
-                py1 = int(palm_cy_px - bh/2)
-                px2 = int(palm_cx_px + bw/2)
-                py2 = int(palm_cy_px + bh/2)
-                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 255), 2)  # yellow box
-                cv2.circle(frame, (int(palm_cx_px), int(palm_cy_px)), 5, (0, 255, 255), -1)
+        
+        # Use hand landmarks (wrist position) when available, else palm box center
+        if len(detected_hands) > 0:
+            for hand_lm, handedness in detected_hands:
+                # Use wrist (index 0) as the reference point for proximity
+                wrist = hand_lm[HandLandmarkDetector.WRIST]
+                cx_norm, cy_norm = wrist.x, wrist.y
+                palm_cx_px = cx_norm * w
+                palm_cy_px = cy_norm * h
+                
+                # Check near ear
+                dist_ear_r = np.hypot(palm_cx_px - ear_r[0], palm_cy_px - ear_r[1])
+                dist_ear_l = np.hypot(palm_cx_px - ear_l[0], palm_cy_px - ear_l[1])
+                near_ear = (dist_ear_r <= r_ear_right) or (dist_ear_l <= r_ear_left)
+                
+                # Check near face
+                near_face = np.hypot(palm_cx_px - face_center[0], palm_cy_px - face_center[1]) < args.hand_near_face_px
+                
+                if near_ear and near_face:
+                    frame_hand_near_ear = True
+                elif near_face:
+                    frame_hand_near_face = True
+                
+                hand_coords.append((cx_norm, cy_norm))
+                
+                if fid % 30 == 0:
+                    print(f"[Hand-LM] wrist=({cx_norm:.2f},{cy_norm:.2f}) near_ear={near_ear} near_face={near_face}")
+        else:
+            # Fallback: use palm box center positions
+            for cx_norm, cy_norm, bw, bh in detected_palm_positions:
+                palm_cx_px = cx_norm * w
+                palm_cy_px = cy_norm * h
+                
+                # Check near ear (palm box center within ear radius)
+                dist_ear_r = np.hypot(palm_cx_px - ear_r[0], palm_cy_px - ear_r[1])
+                dist_ear_l = np.hypot(palm_cx_px - ear_l[0], palm_cy_px - ear_l[1])
+                near_ear = (dist_ear_r <= r_ear_right) or (dist_ear_l <= r_ear_left)
+                
+                # Check near face (palm center within face_h distance of face center)
+                near_face = np.hypot(palm_cx_px - face_center[0], palm_cy_px - face_center[1]) < args.hand_near_face_px
+                
+                if near_ear and near_face:
+                    frame_hand_near_ear = True
+                elif near_face:
+                    frame_hand_near_face = True
+                
+                hand_coords.append((cx_norm, cy_norm))
+                
+                if fid % 30 == 0:
+                    print(f"[Hand-Palm] center=({cx_norm:.2f},{cy_norm:.2f}) near_ear={near_ear} near_face={near_face} "
+                          f"d_ear_r={dist_ear_r:.0f} d_ear_l={dist_ear_l:.0f}")
+                
+                # Draw palm box on frame
+                if not args.no_mesh_display:
+                    px1 = int(palm_cx_px - bw/2)
+                    py1 = int(palm_cy_px - bh/2)
+                    px2 = int(palm_cx_px + bw/2)
+                    py2 = int(palm_cy_px + bh/2)
+                    cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 255, 255), 2)  # yellow box
+                    cv2.circle(frame, (int(palm_cx_px), int(palm_cy_px)), 5, (0, 255, 255), -1)
         
         # Texting detection: 2 palms, both low, close together
         if not calibration_mode and len(hand_coords) == 2:
