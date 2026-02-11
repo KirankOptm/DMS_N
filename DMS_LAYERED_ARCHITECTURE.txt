@@ -1,0 +1,548 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    DMS LAYERED ARCHITECTURE DOCUMENTATION
+                           Driver Monitoring System
+                              January 23, 2026
+═══════════════════════════════════════════════════════════════════════════════
+
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                         LAYER 7: ACTION & OUTPUT LAYER                        ║
+║  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                ║
+║  │ Buzzer Control  │  │ Alert Logging   │  │ Visualization   │                ║
+║  │ - Pattern beeps │  │ - File logs     │  │ - OpenCV display│                ║
+║  │ - LED control   │  │ - Terminal print│  │ - TCP sender    │                ║
+║  └─────────────────┘  └─────────────────┘  └─────────────────┘                ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+                                    ▲
+                                    │ (Triggers actions)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                      LAYER 6: RISK ASSESSMENT & ALERTS                        ║
+║  ┌──────────────────────────────────────────────────────────────────────┐    ║
+║  │ KSS Calculator (AIS 184 Compliance)                                  │    ║
+║  │ - Multi-factor weighted scoring (PERCLOS 35%, EAR 25%, etc.)         │    ║
+║  │ - Piecewise linear mapping + EMA smoothing                           │    ║
+║  │ - Output: KSS 1.0-9.0 scale                                          │    ║
+║  └──────────────────────────────────────────────────────────────────────┘    ║
+║  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────────┐     ║
+║  │ Alert Manager    │  │ Critical Override│  │ Latency Tracker         │     ║
+║  │ - Cooldown logic │  │ - Eyes >1.5s→9.0 │  │ - Pipeline timing       │     ║ 
+║  │ - Severity levels│  │ - Head nod→7.0   │  │ - Bottleneck analysis   │     ║
+║  └──────────────────┘  └──────────────────┘  └─────────────────────────┘     ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+                                    ▲
+                                    │ (Behavioral features)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                      LAYER 5: BEHAVIOR ANALYSIS LAYER                         ║
+║  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐                 ║
+║  │ Eye Monitoring │  │ Head Analysis  │  │ Hand Activity  │                 ║
+║  │ - Closure dur. │  │ - Droop detect │  │ - Smoking      │                 ║
+║  │ - Blink rate   │  │ - Turn detect  │  │ - Phone/text   │                 ║
+║  │ - Closure speed│  │ - Tilt detect  │  │ - Hand-to-mouth│                 ║
+║  │ - PERCLOS      │  │ - Yaw/pitch    │  │ - Chest clutch │                 ║
+║  └────────────────┘  └────────────────┘  └────────────────┘                 ║
+║  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐                 ║
+║  │ Gaze Tracking  │  │ Yawn Detection │  │ Seatbelt Check │                 ║
+║  │ - L/R/UP/DOWN  │  │ - MAR threshold│  │ - YOLO results │                 ║
+║  │ - 2D iris pos. │  │ - 4 frame conf.│  │ - Cycling logic│                 ║
+║  └────────────────┘  └────────────────┘  └────────────────┘                 ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+                                    ▲
+                                    │ (Raw features)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                     LAYER 4: FEATURE EXTRACTION LAYER                         ║
+║  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐ ║
+║  │ EAR Calculation    │  │ MAR Calculation    │  │ Gaze Direction        │ ║
+║  │ - Left/right eyes  │  │ - Mouth landmarks  │  │ - Iris center (2D)    │ ║
+║  │ - EMA smoothing    │  │ - Aspect ratio     │  │ - Horizontal/vertical │ ║
+║  └────────────────────┘  └────────────────────┘  └────────────────────────┘ ║
+║  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐ ║
+║  │ Head Pose Angles   │  │ Hand Positions     │  │ Face Recognition      │ ║
+║  │ - Euler angles     │  │ - Proximity check  │  │ - Embedding compare   │ ║
+║  │ - PnP solver       │  │ - ROI filtering    │  │ - TFLite inference    │ ║
+║  └────────────────────┘  └────────────────────┘  └────────────────────────┘ ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+                                    ▲
+                                    │ (Landmarks & detections)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║               LAYER 3: ML MODEL INFERENCE (WITH THREAD WORKER)                ║
+║  ┌─────────────────────────────────────────────────────────────────────┐     ║
+║  │ MAIN THREAD: MediaPipe Processing (909ms - 86% bottleneck)          │     ║
+║  │ ┌───────────────┐  ┌───────────────┐  ┌───────────────┐            │     ║
+║  │ │ FaceMesh      │  │ Hands         │  │ Pose          │            │     ║
+║  │ │ - 468 lndmrks │  │ - 21 lndmrks  │  │ - 33 lndmrks  │            │     ║
+║  │ │ - Eye/mouth   │  │ - Hand detect │  │ - Shoulders   │            │     ║
+║  │ └───────────────┘  └───────────────┘  └───────────────┘            │     ║
+║  └─────────────────────────────────────────────────────────────────────┘     ║
+║                                                                                ║
+║  ┌─────────────────────────────────────────────────────────────────────┐     ║
+║  │ YOLO WORKER THREAD (Async, runs every 10 seconds)                   │     ║
+║  │ ┌─────────────────────────────────────────────────────────────────┐ │     ║
+║  │ │ YOLOv8 Detection (best_640.onnx)                                │ │     ║
+║  │ │ - Seatbelt worn/not worn                                        │ │     ║
+║  │ │ - Cigarette detection (mouth/hand)                              │ │     ║
+║  │ │ - Eye open/closed                                               │ │     ║
+║  │ │                                                                  │ │     ║
+║  │ │ Thread Communication:                                           │ │     ║
+║  │ │   Main → Worker: yolo_worker.submit(frame)  [Queue]            │ │     ║
+║  │ │   Worker → Main: yolo_worker.get_latest()   [Timestamped]      │ │     ║
+║  │ └─────────────────────────────────────────────────────────────────┘ │     ║
+║  └─────────────────────────────────────────────────────────────────────┘     ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+                                    ▲
+                                    │ (Raw frames)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                  LAYER 2: HARDWARE ABSTRACTION & DRIVERS                      ║
+║  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐ ║
+║  │ Camera Interface   │  │ Buzzer Driver      │  │ File I/O              │ ║
+║  │ - OpenCV capture   │  │ - sysfs LED write  │  │ - Log rotation        │ ║
+║  │ - Frame buffering  │  │ - Beep patterns    │  │ - CSV tracking        │ ║
+║  │ - Auto-detection   │  │ - GPIO control     │  │ - JSON storage        │ ║
+║  └────────────────────┘  └────────────────────┘  └────────────────────────┘ ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+                                    ▲
+                                    │ (System calls)
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                       LAYER 1: HARDWARE & OS LAYER                            ║
+║  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────────┐ ║
+║  │ Camera Hardware    │  │ LED/Buzzer HW      │  │ Storage                │ ║
+║  │ - /dev/video*      │  │ - GPIO pins        │  │ - eMMC/SD card        │ ║
+║  │ - V4L2 interface   │  │ - LED drivers      │  │ - File system         │ ║
+║  │ - IMX93 ISP        │  │ - PWM (optional)   │  │ - Network (TCP)       │ ║
+║  └────────────────────┘  └────────────────────┘  └────────────────────────┘ ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                           THREAD COMMUNICATION DETAIL
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              MAIN THREAD                                     │
+│                          (Frame: 0.95 FPS / 1054ms)                          │
+│                                                                              │
+│  Loop Iteration:                                                             │
+│  1. Capture frame (9ms)                ────────────────┐                     │
+│  2. RGB conversion                                     │                     │
+│  3. MediaPipe inference (909ms) ───────────────────────┼─────────────┐      │
+│  4. Feature extraction (30ms)                          │             │      │
+│  5. Behavior analysis (20ms)                           │             │      │
+│  6. KSS calculation (136ms)                            │             │      │
+│  7. Alert management                                   │             │      │
+│  8. Visualization & logging                            │             │      │
+│                                                        │             │      │
+│  YOLO Submission (every 10s):                         │             │      │
+│    if (time.time() - last_submit) >= 10.0:            │             │      │
+│        yolo_worker.submit(frame) ──────────────────────┼─────┐       │      │
+│        last_submit = time.time()                       │     │       │      │
+│                                                        │     │       │      │
+│  YOLO Result Retrieval (every frame):                 │     │       │      │
+│    latest = yolo_worker.get_latest() ◄─────────────────┼─────┼───────┼──┐   │
+│    if latest and latest.ts > last_ts:                  │     │       │  │   │
+│        dets = latest.results                           │     │       │  │   │
+│                                                        │     │       │  │   │
+└────────────────────────────────────────────────────────┼─────┼───────┼──┼───┘
+                                                         │     │       │  │
+                                                         │     ▼       │  │
+                                    ┌────────────────────┼─────────────┼──┼───┐
+                                    │                    │  QUEUE      │  │   │
+                                    │   Frame Queue      │ (max 2)     │  │   │
+                                    │   [frame_rgb]  ────┘             │  │   │
+                                    └──────────────────────────────────┼──┼───┘
+                                                                       │  │
+                                                                       ▼  │
+┌────────────────────────────────────────────────────────────────────────┼───┐
+│                           YOLO WORKER THREAD                              │   │
+│                        (Async, non-blocking)                              │   │
+│                                                                           │   │
+│  Background Loop:                                                         │   │
+│  1. Wait for frame from queue (blocking)                                  │   │
+│  2. YOLO inference (~200-500ms)                                           │   │
+│  3. Post-process detections                                               │   │
+│  4. Store results with timestamp ─────────────────────────────────────────┘   │
+│     - (timestamp, detections) tuple                                           │
+│     - Atomic update (thread-safe)                                             │
+│                                                                               │
+│  Result Storage:                                                              │
+│    self.latest_result = (time.time(), processed_dets)                        │
+│    # Main thread polls this variable                                         │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                          KEY ARCHITECTURAL PRINCIPLES
+═══════════════════════════════════════════════════════════════════════════════
+
+1. DEPENDENCY DIRECTION (Bottom-up):
+   --------------------------------
+   - Each layer only depends on layers below it
+   - Layer 7 → Layer 1 (actions depend on hardware)
+   - No circular dependencies
+   
+   Example flow:
+   Hardware → Drivers → ML Models → Features → Behaviors → Risk → Actions
+
+2. SEPARATION OF CONCERNS:
+   -----------------------
+   - Hardware abstraction (Layer 2) isolates OS-specific code
+   - ML inference (Layer 3) separated from business logic (Layer 5)
+   - Risk assessment (Layer 6) decoupled from feature extraction (Layer 4)
+   - Clear boundaries enable independent testing and maintenance
+
+3. THREAD ISOLATION:
+   -----------------
+   - Main thread: Real-time face/hand/pose monitoring (1 FPS)
+   - YOLO thread: Periodic object detection (every 10 seconds)
+   - Communication via queue (submit) and shared variable (get_latest)
+   - No mutex/locks needed - simple polling mechanism
+
+4. DATA FLOW (Unidirectional):
+   ---------------------------
+   Raw Frame
+     ↓
+   ML Inference (MediaPipe + YOLO)
+     ↓
+   Feature Extraction (EAR, MAR, Gaze, Pose)
+     ↓
+   Behavior Analysis (Eye closure, Head droop, Hand activity)
+     ↓
+   Risk Assessment (KSS calculation, Alert management)
+     ↓
+   Actions (Buzzer, Logs, Display)
+
+5. PERFORMANCE BOTTLENECK:
+   ----------------------
+   - Layer 3 MediaPipe: 909ms (86% of total frame time)
+   - Face mesh: ~468 landmarks processing
+   - Primary optimization target for performance improvements
+   - Alternative: Lighter models, frame skipping, resolution reduction
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                        COMPONENT DETAILS BY LAYER
+═══════════════════════════════════════════════════════════════════════════════
+
+LAYER 7: ACTION & OUTPUT
+------------------------
+File: dms_integrated_mdp_yolo_log.py (lines 73-81, 3200-3250)
+Components:
+  - buzzer_beep(): Pattern-based beeping (8 times for critical alerts)
+  - add_alert(): Log alerts to file and terminal
+  - cv2.imshow(): Display video feed with overlays
+  - FrameSender: TCP streaming to remote monitoring station
+
+LAYER 6: RISK ASSESSMENT & ALERTS
+---------------------------------
+File: kss_calculator.py
+Components:
+  - KSSCalculator: Multi-factor weighted scoring system
+    * Inputs: PERCLOS, EAR, blink rate, yawn rate, head droop
+    * Weights: 35%, 25%, 15%, 10%, 5%
+    * Output: KSS 1.0-9.0 (AIS 184 compliance)
+  
+File: dms_integrated_mdp_yolo_log.py (lines 2413-2520)
+Components:
+  - KSSAlertManager: Cooldown logic, severity classification
+  - Critical Overrides: 
+    * Eyes >1.5s → KSS 9.0
+    * Head nod 1-2s → KSS 7.0
+    * Head droop >2s → KSS 8.0
+
+File: dms_latency_tracker.py
+Components:
+  - LatencyTracker: Pipeline timing analysis
+  - print_kss7_latency(): Terminal output for KSS >= 7.0
+  - log_kss_pipeline(): File logging for eye closure events
+
+LAYER 5: BEHAVIOR ANALYSIS
+--------------------------
+File: dms_integrated_mdp_yolo_log.py (lines 1770-2400)
+Components:
+  - Eye Monitoring:
+    * Closure duration tracking (1.5s threshold)
+    * Blink rate analysis (60s window)
+    * Closure speed calculation (rate of EAR change)
+    * PERCLOS estimation
+  
+  - Head Analysis:
+    * Droop detection (vertical displacement)
+    * Turn detection (yaw angle thresholds)
+    * Tilt detection (pitch angle)
+    * Sustained droop tracking (>2s)
+  
+  - Hand Activity:
+    * Smoking detection (hand-to-mouth repetition)
+    * Phone/texting detection (hand position)
+    * Chest clutch detection (medical distress)
+  
+  - Gaze Tracking:
+    * 4-direction classification (L/R/UP/DOWN)
+    * Mirror check detection (vertical gaze)
+    * Dashboard/phone check (downward gaze)
+  
+  - Yawn Detection:
+    * MAR threshold > 0.6
+    * 4-frame confirmation
+  
+  - Seatbelt Status:
+    * YOLO result integration
+    * 10-second periodic check
+
+LAYER 4: FEATURE EXTRACTION
+---------------------------
+File: dms_integrated_mdp_yolo_log.py (lines 1690-1770)
+Components:
+  - EAR Calculation:
+    * get_aspect_ratio(): Eye aspect ratio from 6 landmarks
+    * EMA smoothing (factor 0.3) for jitter reduction
+    * Separate left/right eye tracking
+  
+  - MAR Calculation:
+    * get_mar(): Mouth aspect ratio from 4 landmarks
+    * Deque-based moving average
+  
+  - Gaze Direction:
+    * 2D iris center calculation (LEFT_IRIS + RIGHT_IRIS average)
+    * Horizontal/vertical position normalization
+    * Calibration-based baseline adjustment
+  
+  - Head Pose Angles:
+    * compute_head_angles(): PnP solver for Euler angles
+    * Yaw/pitch/roll extraction
+    * EMA smoothing for stability
+  
+  - Hand Positions:
+    * hand_near_face(): Distance-based proximity check
+    * hand_near_ear(): Ear landmark proximity
+    * ROI filtering (chest/torso regions)
+  
+File: authenticate_face_board.py (if face recognition enabled)
+Components:
+  - Face Recognition:
+    * TFLite embedding extraction
+    * Cosine similarity comparison
+    * Driver authentication
+
+LAYER 3: ML MODEL INFERENCE
+---------------------------
+File: dms_integrated_mdp_yolo_log.py (lines 1635-1655)
+Main Thread Components:
+  - MediaPipe FaceMesh:
+    * 468 facial landmarks
+    * Eye contours (LEFT_EYE, RIGHT_EYE)
+    * Mouth contours (MOUTH)
+    * Iris landmarks (LEFT_IRIS, RIGHT_IRIS)
+    * Processing time: ~909ms (86% bottleneck)
+  
+  - MediaPipe Hands:
+    * 21 hand landmarks per hand
+    * Multi-hand detection (max 2)
+    * Gesture recognition support
+  
+  - MediaPipe Pose:
+    * 33 body landmarks
+    * Shoulder/hip detection for torso ROI
+    * Upper body pose estimation
+
+File: yolo_utils.py / YOLOWorker class
+YOLO Worker Thread Components:
+  - YOLOv8 Detection (best_640.onnx):
+    * Classes: no_seatbelt, seatbelt_worn
+    * Classes: cigarette_mouth, cigarette_hand, no_cigarette
+    * Classes: eye_open, eye_closed
+    * Inference time: ~200-500ms
+    * Runs every 10 seconds (YOLO_INTERVAL = 10.0)
+  
+  Thread Communication:
+    * Queue-based frame submission (maxsize=2)
+    * Timestamp-based result retrieval
+    * Atomic variable update (thread-safe)
+
+LAYER 2: HARDWARE ABSTRACTION & DRIVERS
+---------------------------------------
+File: dms_integrated_mdp_yolo_log.py (lines 93-128, 39-81)
+Components:
+  - Camera Interface:
+    * find_available_camera(): Auto-detect /dev/video* devices
+    * cv2.VideoCapture(): OpenCV capture initialization
+    * Frame buffering and format handling
+  
+  - Buzzer Driver:
+    * BUZZER = "/sys/class/leds/green:user1/brightness"
+    * _check_buzzer(): Verify hardware availability
+    * buzzer_on() / buzzer_off(): sysfs write operations
+    * buzzer_beep(): Timed pattern control
+  
+  - File I/O:
+    * Log rotation (dms_integrated_mdp_yolo_log.txt)
+    * CSV tracking (drivers.json)
+    * Configuration files (args parsing)
+
+LAYER 1: HARDWARE & OS
+---------------------
+Platform: NXP i.MX93 Evaluation Board
+Components:
+  - Camera Hardware:
+    * V4L2 interface (/dev/video0, /dev/video1, etc.)
+    * ISP pipeline
+    * Resolution: 640x480 or configurable
+  
+  - LED/Buzzer Hardware:
+    * GPIO-based LED control
+    * sysfs interface: /sys/class/leds/
+    * PWM support (optional for buzzer)
+  
+  - Storage:
+    * eMMC/SD card file system
+    * Network interfaces (TCP/IP for remote streaming)
+    * Linux kernel drivers
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                          PERFORMANCE CHARACTERISTICS
+═══════════════════════════════════════════════════════════════════════════════
+
+Frame Processing Breakdown (1054ms total @ 0.95 FPS):
+-----------------------------------------------------
+1. Camera Capture:       9ms   (1%)
+2. RGB Conversion:       ~5ms  (0.5%)
+3. MediaPipe Inference:  909ms (86%) ← PRIMARY BOTTLENECK
+   - FaceMesh:          ~700ms
+   - Hands:             ~150ms
+   - Pose:              ~59ms
+4. Feature Extraction:   30ms  (3%)
+5. Behavior Analysis:    20ms  (2%)
+6. KSS Calculation:      136ms (13%)
+7. Alert Management:     ~1ms  (0.1%)
+8. Visualization:        ~10ms (1%)
+
+YOLO Worker Thread (Asynchronous, every 10 seconds):
+----------------------------------------------------
+- Inference time: 200-500ms (variable based on detections)
+- No impact on main thread frame rate
+- Queue-based submission prevents blocking
+
+Optimization Opportunities:
+--------------------------
+1. MediaPipe optimization (Layer 3):
+   - Reduce FaceMesh landmarks (468 → 68 critical points)
+   - Disable pose detection if not needed
+   - Frame skipping (process every 3rd frame → 3 FPS)
+   - Resolution reduction (640x480 → 320x240)
+
+2. KSS calculation (Layer 6):
+   - Cache intermediate results
+   - Reduce calculation frequency (every 3rd frame)
+
+3. YOLO interval (Layer 3):
+   - Current: 10 seconds
+   - Could increase to 15-30s for seatbelt-only scenarios
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                            DESIGN PATTERNS USED
+═══════════════════════════════════════════════════════════════════════════════
+
+1. LAYERED ARCHITECTURE
+   - Separation of concerns across 7 horizontal layers
+   - Clear dependency direction (bottom-up)
+   - Each layer provides abstraction for layer above
+
+2. PRODUCER-CONSUMER PATTERN
+   - Main thread (producer) submits frames to YOLO worker
+   - YOLO worker (consumer) processes frames asynchronously
+   - Queue-based decoupling
+
+3. SINGLETON PATTERN
+   - KSS Calculator: Single instance for state management
+   - Alert Manager: Single instance for cooldown tracking
+   - Latency Tracker: Single instance for timing analysis
+
+4. STRATEGY PATTERN
+   - Different gaze detection strategies (2D iris-based)
+   - Multiple override strategies (eye closure, head droop)
+   - Configurable alert thresholds
+
+5. OBSERVER PATTERN
+   - add_alert() function broadcasts events
+   - Multiple subscribers: file logs, terminal, TCP sender
+   - Decoupled alert generation from notification
+
+6. FACTORY PATTERN
+   - find_available_camera(): Camera creation
+   - MediaPipe model initialization
+   - YOLO worker instantiation
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                              TESTING STRATEGY
+═══════════════════════════════════════════════════════════════════════════════
+
+Unit Testing Approach (by Layer):
+---------------------------------
+
+Layer 7 (Actions):
+  - Test buzzer timing accuracy
+  - Verify log file rotation
+  - Check TCP frame transmission
+
+Layer 6 (Risk Assessment):
+  - KSS calculation accuracy tests
+  - Alert threshold boundary tests
+  - Cooldown logic verification
+
+Layer 5 (Behavior Analysis):
+  - Eye closure duration tracking (target: 1.5s ±0.1s)
+  - Blink rate calculation accuracy
+  - Head droop angle thresholds
+
+Layer 4 (Feature Extraction):
+  - EAR calculation accuracy
+  - Gaze direction classification (4 directions)
+  - Head pose angle estimation
+
+Layer 3 (ML Inference):
+  - MediaPipe landmark detection rate
+  - YOLO detection accuracy (mAP)
+  - Thread synchronization tests
+
+Layer 2 (Drivers):
+  - Camera frame capture reliability
+  - Buzzer hardware availability checks
+  - File I/O error handling
+
+Integration Testing:
+-------------------
+- End-to-end latency measurement (camera → buzzer)
+- Thread communication stress tests
+- Long-running stability tests (24+ hours)
+- Memory leak detection
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                           FUTURE ENHANCEMENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Performance Optimization:
+   - Implement frame skipping (every 3rd frame)
+   - Add hardware acceleration (NPU for YOLO)
+   - Optimize MediaPipe settings (reduce landmarks)
+
+2. Functionality Extensions:
+   - Add voice alerts (text-to-speech)
+   - Implement gesture controls
+   - Add night mode (IR camera support)
+
+3. Architecture Improvements:
+   - Move YOLO to separate process (multiprocessing)
+   - Add caching layer for feature extraction
+   - Implement hot-swappable model loading
+
+4. Monitoring & Diagnostics:
+   - Add real-time performance dashboard
+   - Implement remote configuration updates
+   - Add health check endpoints
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                              END OF DOCUMENT
+═══════════════════════════════════════════════════════════════════════════════

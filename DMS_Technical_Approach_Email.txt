@@ -1,0 +1,47 @@
+Subject: Need your input on DMS approach – classification vs object detection
+
+Hi [Manager Name],
+
+I've been digging into the technical architecture for our DMS system and hit a decision point where I need your guidance.
+
+Quick context: We've finalized the camera mounting (A-pillar, 10cm above eye level) which matches what Mobileye and other industry players use. This gives us a good frontal view of the driver's face and torso, which is exactly what we need for certification compliance.
+
+Now here's where I need your call:
+
+I've tested two different approaches for detecting seatbelt, phone usage, and smoking:
+
+**Approach 1 - Classification based (my recommendation):**
+This uses MediaPipe to first identify body regions (torso, hands), then runs specialized classifiers on those specific areas. Think of it like zooming into the relevant parts before analyzing them.
+
+Results I'm seeing:
+- Seatbelt: 88-93% accuracy
+- Phone: 88-93% accuracy  
+- Smoking: 82-88% accuracy
+- Drowsiness: 94-96% accuracy
+
+The big win here is it handles real-world messiness well - drivers wearing jackets over seatbelts, gloves, different lighting conditions. Even if the belt is 40% hidden by a vest, the classifier still picks up the pattern.
+
+**Approach 2 - Object detection:**
+Single YOLO model trying to spot everything in the full frame at once. Simpler architecture, but the accuracy drops significantly:
+- Seatbelt: 78-85% (struggles with thin objects)
+- Phone: 85-90%
+- Smoking: 70-78% (cigarette is just too small)
+
+Here's the thing - I looked at what our competitors are actually using in production. Mobileye, Aptiv, Lytx all use the classification approach and they're hitting 88-93% accuracy. Only the budget-tier systems (like Nauto) use pure object detection and accept the 78-85% range.
+
+From a technical standpoint, classification works better with our A-pillar angle because we're isolating the torso region (320x320 pixels) instead of the detector searching a massive 1280x720 frame for a thin 5cm seatbelt. It's just physics - a magnified focused view beats trying to spot tiny objects in a wide shot.
+
+What I need from you:
+
+1. Do our target customers (mining, logistics) have hard accuracy requirements? If they need 90%+, we have to go classification. Object detection won't cut it.
+
+2. Are we okay with 10 weeks development time? Classification is actually 2 weeks faster despite being multi-model.
+
+3. Should we just match the industry standard (88-93%) or do you want me to add a $8 magnetic buckle sensor to get 99% seatbelt accuracy? (That's what Mercedes and Volvo do for their premium systems)
+
+My recommendation is go with classification - it meets certification requirements, has lower risk, and we can ship in 10 weeks. But wanted to get your take before I commit the team to this direction.
+
+Let me know your thoughts.
+
+Thanks,
+[Your Name]

@@ -1,0 +1,400 @@
+KSS SCORE LEVELS & EXACT CONDITIONS TO REACH EACH LEVEL
+AIS 184 Implementation - DMS System
+
+
+OVERVIEW
+========
+KSS (Karolinska Sleepiness Scale) ranges from 1.0 (Extremely Alert) to 9.0 
+(Extreme Drowsiness/Fighting Sleep). The score is calculated using 6 drowsiness 
+indicators with weighted combination and piecewise linear mapping.
+
+--------------------------------------------------------------------------------
+CALCULATION FORMULA
+--------------------------------------------------------------------------------
+
+STEP 1: Normalize Inputs (0 to 1 Scale)
+========================================
+
+P_norm = Min(1.0, PERCLOS / 50.0)
+         - PERCLOS: Percentage of time eyes closed (0-50%)
+         - Weight: 35% (most important)
+
+E_norm = Max(0.0, Min(1.0, (0.28 - Avg_EAR) / 0.16))
+         - Avg_EAR: Average Eye Aspect Ratio (0.12-0.28)
+         - Weight: 25%
+         - Lower EAR = more drowsy (inverted scale)
+
+B_norm = Blink Rate Abnormality
+         - If blink_rate < 8:  (15 - blink_rate) / 15.0
+         - If blink_rate > 22: (blink_rate - 15) / 15.0
+         - Else: 0.0
+         - Result: Max(0.0, Min(1.0, B_norm))
+         - Normal: 15 bpm
+         - Weight: 15%
+
+D_norm = Max(0.0, Min(1.0, (Blink_Duration - 0.1) / 0.4))
+         - Blink_Duration: Average blink duration in seconds (0.1-0.5s)
+         - Weight: 10%
+
+Y_norm = Min(1.0, Yawn_Rate / 3.0)
+         - Yawn_Rate: Yawns per minute (0-3+)
+         - Weight: 10%
+
+H_norm = Min(1.0, Head_Droop_Duration / 10.0)
+         - Head_Droop_Duration: Seconds of head droop (0-10s)
+         - Weight: 5%
+
+
+STEP 2: Weighted Combination
+=============================
+
+Combined_Score = (0.35 × P_norm) + (0.25 × E_norm) + (0.15 × B_norm) + 
+                 (0.10 × D_norm) + (0.10 × Y_norm) + (0.05 × H_norm)
+
+Result: 0.0 - 1.0 scale
+
+
+STEP 3: Piecewise Linear Mapping to KSS (1-9)
+==============================================
+
+IF Combined_Score < 0.1:
+    KSS_raw = 1.0 + (Combined_Score / 0.1) × 2.0
+    Range: 1.0 - 3.0 (Extremely Alert to Alert)
+
+ELSE IF Combined_Score < 0.3:
+    KSS_raw = 3.0 + ((Combined_Score - 0.1) / 0.2) × 2.0
+    Range: 3.0 - 5.0 (Alert to Neither Alert/Nor Sleepy)
+
+ELSE IF Combined_Score < 0.6:
+    KSS_raw = 5.0 + ((Combined_Score - 0.3) / 0.3) × 2.0
+    Range: 5.0 - 7.0 (Sleepy to AIS 184 Alert Threshold)
+
+ELSE:
+    KSS_raw = 7.0 + ((Combined_Score - 0.6) / 0.4) × 2.0
+    Range: 7.0 - 9.0 (Fighting Sleep - AIS 184 Warning/Critical)
+
+Clamp: KSS_raw = Max(1.0, Min(9.0, KSS_raw))
+
+
+STEP 4: Temporal Smoothing (EMA)
+=================================
+
+IF first calculation:
+    KSS_final = KSS_raw
+
+ELSE:
+    KSS_final = (0.3 × KSS_raw) + (0.7 × Previous_KSS)
+    
+This provides smooth transitions between states (30% new, 70% history).
+
+
+================================================================================
+EXACT CONDITIONS TO REACH EACH KSS LEVEL
+================================================================================
+
+--------------------------------------------------------------------------------
+KSS 1.0 - EXTREMELY ALERT
+--------------------------------------------------------------------------------
+Combined Score Required: 0.0
+Label: "Extremely Alert"
+Alert Level: None (Safe)
+Buzzer Pattern: None
+
+Exact Conditions:
+- PERCLOS: 0% (eyes always open)
+- Average EAR: 0.28+ (wide open eyes)
+- Blink Rate: 15 bpm (normal)
+- Blink Duration: <0.1s (quick blinks)
+- Yawn Rate: 0/min (no yawning)
+- Head Droop: 0s (no head movement)
+
+Real-World Scenario:
+Fresh driver at trip start, fully rested, no drowsiness indicators.
+
+
+--------------------------------------------------------------------------------
+KSS 2.0 - EXTREME ALERT
+--------------------------------------------------------------------------------
+Combined Score Required: 0.05
+Label: "Extreme Alert"
+Alert Level: None (Safe)
+Buzzer Pattern: None
+
+Exact Conditions:
+- PERCLOS: 2.5% (occasional brief closure)
+- Average EAR: 0.27 (slightly lower than ideal)
+- Blink Rate: 15 bpm (normal)
+- Blink Duration: 0.1s (normal)
+- Yawn Rate: 0/min
+- Head Droop: 0s
+
+Calculation Example:
+Combined = 0.35×(2.5/50) + 0.25×((0.28-0.27)/0.16) + 0 + 0 + 0 + 0
+         = 0.35×0.05 + 0.25×0.0625
+         = 0.0175 + 0.0156 = 0.033
+KSS = 1.0 + (0.033/0.1)×2.0 = 1.66 ≈ 2.0 (after smoothing)
+
+Real-World Scenario:
+Alert driver with occasional quick blinks, no drowsiness signs.
+
+
+--------------------------------------------------------------------------------
+KSS 3.0 - ALERT
+--------------------------------------------------------------------------------
+Combined Score Required: 0.10
+Label: "Alert"
+Alert Level: None (Safe)
+Buzzer Pattern: None
+
+Exact Conditions:
+- PERCLOS: 5% (eyes closed 5% of time)
+- Average EAR: 0.25
+- Blink Rate: 15 bpm (normal)
+- Blink Duration: 0.1s
+- Yawn Rate: 0/min
+- Head Droop: 0s
+
+Calculation Example:
+Combined = 0.35×(5/50) + 0.25×((0.28-0.25)/0.16)
+         = 0.35×0.1 + 0.25×0.1875
+         = 0.035 + 0.047 = 0.082
+KSS = 1.0 + (0.082/0.1)×2.0 = 2.64 ≈ 3.0 (after smoothing)
+
+Real-World Scenario:
+Normal alert driver with regular blinking patterns.
+
+
+--------------------------------------------------------------------------------
+KSS 4.0 - NEITHER ALERT NOR SLEEPY
+--------------------------------------------------------------------------------
+Combined Score Required: 0.15
+Label: "Neither Alert/Nor Sleepy"
+Alert Level: Early Warning (No Buzzer)
+Buzzer Pattern: None
+
+Exact Conditions:
+- PERCLOS: 7.5%
+- Average EAR: 0.24
+- Blink Rate: 12 bpm (slightly abnormal)
+- Blink Duration: 0.15s
+- Yawn Rate: 0.5/min (occasional)
+- Head Droop: 0s
+
+Calculation Example:
+Combined = 0.35×(7.5/50) + 0.25×((0.28-0.24)/0.16) + 0.15×(0.20)
+         = 0.0525 + 0.0625 + 0.03
+         = 0.145
+KSS = 3.0 + ((0.145-0.1)/0.2)×2.0 = 3.45 ≈ 4.0 (after smoothing)
+
+Real-World Scenario:
+Driver showing early signs of reduced alertness, slightly slower blinking.
+
+
+--------------------------------------------------------------------------------
+KSS 5.0 - SLEEPY
+--------------------------------------------------------------------------------
+Combined Score Required: 0.30
+Label: "Sleepy"
+Alert Level: Moderate Warning (No Buzzer)
+Buzzer Pattern: None
+
+Exact Conditions:
+- PERCLOS: 15%
+- Average EAR: 0.22
+- Blink Rate: 10 bpm (abnormal - slow)
+- Blink Duration: 0.3s (longer than normal)
+- Yawn Rate: 1.0/min
+- Head Droop: 0s
+
+Calculation Example:
+Combined = 0.35×(15/50) + 0.25×((0.28-0.22)/0.16) + 0.15×(0.33) + 0.10×(0.3/0.4)
+         = 0.105 + 0.094 + 0.050 + 0.075
+         = 0.324
+KSS = 5.0 + ((0.324-0.3)/0.3)×2.0 = 5.16 ≈ 5.0 (after smoothing)
+
+Real-World Scenario:
+Driver experiencing noticeable drowsiness, occasional yawning, slower reactions.
+
+Test Scenario Match:
+- 4 slow blinks per 30s (0.5s duration) → PERCLOS 6.67%, Duration 0.5s
+- 1 yawn → Yawn rate 2/min
+- 1 head nod (2s) → Head droop 2s
+Result: KSS ≈ 5.6
+
+
+--------------------------------------------------------------------------------
+KSS 6.0 - SLEEPY (SIGNIFICANT)
+--------------------------------------------------------------------------------
+Combined Score Required: 0.45
+Label: "Sleepy"
+Alert Level: High Warning (No Buzzer)
+Buzzer Pattern: None
+
+Exact Conditions:
+- PERCLOS: 22.5%
+- Average EAR: 0.20
+- Blink Rate: 8 bpm (very abnormal - very slow)
+- Blink Duration: 0.35s (significantly long)
+- Yawn Rate: 1.5/min (frequent)
+- Head Droop: 2s
+
+Calculation Example:
+Combined = 0.35×(22.5/50) + 0.25×((0.28-0.20)/0.16) + 0.15×(0.47) + 0.10×(0.35/0.4) + 0.10×(1.5/3)
+         = 0.158 + 0.125 + 0.070 + 0.088 + 0.050
+         = 0.491
+KSS = 5.0 + ((0.491-0.3)/0.3)×2.0 = 6.27 ≈ 6.0 (after smoothing)
+
+Real-World Scenario:
+Driver struggling to stay alert, frequent yawning, heavy eyelids, head starting to droop.
+
+Test Scenario Match:
+- 4 slow blinks per 30s (0.5s duration) → PERCLOS 6.67%, Duration 0.5s
+- 3 yawns → Yawn rate 6/min (maxed)
+- 1 head nod (2s) → Head droop 2s
+Result: KSS ≈ 5.8
+
+
+--------------------------------------------------------------------------------
+KSS 7.0 - SLEEPY BUT FIGHTING (AIS 184 ALERT THRESHOLD)
+--------------------------------------------------------------------------------
+Combined Score Required: 0.60
+Label: "Sleepy"
+Alert Level: WARNING (AIS 184 Compliance)
+Buzzer Pattern: 1 long beep (0.2s)
+
+Exact Conditions:
+- PERCLOS: 30%
+- Average EAR: 0.18 (EAR_CLOSED_THRESHOLD)
+- Blink Rate: 7 bpm (severely abnormal)
+- Blink Duration: 0.4s (very long)
+- Yawn Rate: 2.0/min (frequent)
+- Head Droop: 2s
+
+Calculation Example:
+Combined = 0.35×(30/50) + 0.25×((0.28-0.18)/0.16) + 0.15×(0.53) + 0.10×(0.4/0.4) + 0.10×(2/3) + 0.05×(2/10)
+         = 0.210 + 0.156 + 0.080 + 0.100 + 0.067 + 0.010
+         = 0.623
+KSS = 7.0 + ((0.623-0.6)/0.4)×2.0 = 7.12 ≈ 7.0 (after smoothing)
+
+Console Output:
+[ALERT 04:20:32] WARNING: Driver Drowsiness Detected
+[Buzzer] Beeping 1 time(s)...
+
+Real-World Scenario:
+Driver fighting to stay awake, eyes closing frequently, significant head droop.
+MANDATORY ALERT per AIS 184 standard.
+
+
+--------------------------------------------------------------------------------
+KSS 8.0 - EXTREME DROWSINESS (AIS 184 CRITICAL)
+--------------------------------------------------------------------------------
+Combined Score Required: 0.80
+Label: "Extreme Drowsiness (Mandatory warning)"
+Alert Level: CRITICAL (AIS 184 Compliance)
+Buzzer Pattern: 6 fast beeps (0.08s on, 0.08s off)
+
+Exact Conditions:
+- PERCLOS: 40%
+- Average EAR: 0.16
+- Blink Rate: 6 bpm (extremely abnormal)
+- Blink Duration: 0.45s (extremely long)
+- Yawn Rate: 2.5/min (very frequent)
+- Head Droop: 5s (sustained)
+
+Calculation Example:
+Combined = 0.35×(40/50) + 0.25×((0.28-0.16)/0.16) + 0.15×(0.60) + 0.10×(0.45/0.4) + 0.10×(2.5/3) + 0.05×(5/10)
+         = 0.280 + 0.188 + 0.090 + 0.113 + 0.083 + 0.025
+         = 0.779
+KSS = 7.0 + ((0.779-0.6)/0.4)×2.0 = 7.90 ≈ 8.0 (after smoothing)
+
+Console Output:
+[ALERT 04:20:32] CRITICAL: Severe Drowsiness Detected
+[Buzzer] Beeping 6 time(s)...
+
+Real-World Scenario:
+Driver in severe drowsiness state, struggling to keep eyes open, frequent yawning,
+sustained head droop. CRITICAL ALERT per AIS 184 standard.
+
+
+--------------------------------------------------------------------------------
+KSS 9.0 - FIGHTING SLEEP (AIS 184 URGENT)
+--------------------------------------------------------------------------------
+Combined Score Required: 1.0 OR Eyes Closed >2s (Override)
+Label: "Extreme Drowsiness (Mandatory warning)"
+Alert Level: URGENT (AIS 184 Compliance)
+Buzzer Pattern: 8 fast beeps (0.08s on, 0.08s off)
+
+METHOD 1: Eyes Closed >2s (CRITICAL OVERRIDE - NO SMOOTHING)
+============================================================
+Condition: Eye closure duration > 2.0 seconds
+Result: KSS = 9.0 (instant, bypasses calculation)
+
+Console Output:
+[ALERT 04:20:32] CRITICAL: Eyes closed 2.3s → KSS=9.0 (DANGER)
+[Buzzer] Beeping 8 time(s)...
+
+This is the PRIMARY SAFETY RULE - fastest alert mechanism.
+
+
+METHOD 2: Combined Score ≥1.0
+==============================
+Exact Conditions:
+- PERCLOS: 50%+ (maximum)
+- Average EAR: 0.14 (nearly closed)
+- Blink Rate: 5 bpm (extremely slow)
+- Blink Duration: 0.5s (maximum)
+- Yawn Rate: 3.0/min (maximum)
+- Head Droop: 10s (maximum)
+
+Calculation Example:
+Combined = 0.35×(50/50) + 0.25×((0.28-0.14)/0.16) + 0.15×(0.67) + 0.10×(0.5/0.4) + 0.10×(3/3) + 0.05×(10/10)
+         = 0.350 + 0.219 + 0.100 + 0.125 + 0.100 + 0.050
+         = 0.944
+KSS = 7.0 + ((0.944-0.6)/0.4)×2.0 = 8.72 ≈ 9.0 (after smoothing)
+
+
+METHOD 3: Head Droop Override (>3s)
+===================================
+Condition: head_droop_duration > 3.0 AND avg_ear < 0.18
+Result: KSS = 9.0 (override)
+
+Condition: head_droop_duration > 3.0 (without eyes closed)
+Result: KSS = 8.0 (critical)
+
+Console Output:
+[ALERT 04:20:32] URGENT: Driver Fighting Sleep!
+[Buzzer] Beeping 8 time(s)...
+
+Real-World Scenario:
+Driver on verge of falling asleep, eyes mostly closed, extreme head droop,
+constant yawning. MAXIMUM ALERT per AIS 184 standard.
+
+
+================================================================================
+CRITICAL OVERRIDES (Bypass Normal Calculation)
+================================================================================
+
+The following conditions FORCE specific KSS scores regardless of calculated value:
+
+1. Eyes Closed >2 Seconds
+   -------------------------
+   Condition: eye_close_duration > 2.0
+   Result: KSS = 9.0 (instant, no smoothing)
+   Reason: Immediate safety threat
+   Priority: HIGHEST
+
+2. Eyes Closed + Head Droop >3 Seconds
+   -------------------------------------
+   Condition: eye_close_duration > 2.0 AND head_droop_duration > 3.0
+   Result: KSS = 9.0
+   Reason: Double confirmation of severe drowsiness
+   Priority: HIGH
+
+3. Head Droop Alone >3 Seconds
+   -----------------------------
+   Condition: head_droop_duration > 3.0 (eyes open)
+   Result: KSS = 8.0 (not 9.0)
+   Reason: Critical but less severe than closed eyes
+   Priority: MEDIUM
+
+

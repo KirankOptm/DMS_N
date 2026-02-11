@@ -1,0 +1,1299 @@
+================================================================================
+DRIVER MONITORING SYSTEM (DMS) - SYSTEM ARCHITECTURE
+NXP i.MX93 EVK Platform
+Date: December 30, 2025
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. System Overview
+2. High-Level Architecture
+3. Component Architecture
+4. Multi-Threading Design
+5. Data Flow Diagram
+6. Hardware Utilization
+7. Model Pipeline
+8. State Machine
+9. Communication Architecture
+10. File Structure
+11. Module Dependencies
+12. Performance Architecture
+13. Memory Architecture
+14. Deployment Architecture
+
+================================================================================
+1. SYSTEM OVERVIEW
+================================================================================
+
+Purpose:
+--------
+Real-time driver monitoring system for detecting:
+  - Driver drowsiness (eye closure, yawning, head droop)
+  - Phone usage (call, texting)
+  - Seatbelt compliance (worn, not worn)
+  - Cigarette smoking (hand, mouth)
+
+Platform:
+---------
+Hardware: NXP i.MX93 EVK
+  - CPU: 2× ARM Cortex-A55 @ 1.7 GHz
+  - NPU: ARM Ethos-U65 (256 MACs)
+  - RAM: 1911 MB DDR4
+  - Camera: USB/CSI @ 640×480, 30 FPS
+
+Software Stack:
+  - OS: Linux (Yocto-based)
+  - Runtime: Python 3.x
+  - Frameworks: OpenCV, TensorFlow Lite, ONNX Runtime
+  - Acceleration: Vela-optimized models for NPU
+
+Performance:
+  - Frame Rate: 10 FPS (main), 5 FPS (monitoring)
+  - CPU Usage: 58-73% average, 100-120% peak
+  - Latency: 100-200ms detection response
+  - Memory: 227 MB resident
+
+================================================================================
+2. HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+System Layers:
+--------------
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                      APPLICATION LAYER                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │ Main Control │  │   UI/Alert   │  │ MJPEG Stream │             │
+│  │   (State)    │  │   Display    │  │   Server     │             │
+│  └──────────────┘  │ Management   │  └──────────────┘             │
+│                     └──────────────┘                                │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↕
+┌─────────────────────────────────────────────────────────────────────┐
+│                     PROCESSING LAYER                                │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │Face Detection│  │ Recognition  │  │  Monitoring  │             │
+│  │   (SCRFD)    │  │  (FR Model)  │  │ (Multi-Model)│             │
+│  └──────────────┘  └──────────────┘  └──────────────┘             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │   FaceMesh   │  │Eye Detection │  │Phone Detection│            │
+│  │ (Landmarks)  │  │ (MobileNet)  │  │ (SSD Mobile) │             │
+│  └──────────────┘  └──────────────┘  └──────────────┘             │
+│  ┌──────────────┐                                                   │
+│  │     YOLO     │  (Seatbelt & Cigarette Detection)                │
+│  │  (Periodic)  │                                                   │
+│  └──────────────┘                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↕
+┌─────────────────────────────────────────────────────────────────────┐
+│                    HARDWARE ABSTRACTION LAYER                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐             │
+│  │  NPU Driver  │  │  CPU Runtime │  │ Camera Driver│             │
+│  │ (Ethos-U65)  │  │ (TFLite/ORT) │  │   (V4L2)     │             │
+│  └──────────────┘  └──────────────┘  └──────────────┘             │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↕
+┌─────────────────────────────────────────────────────────────────────┐
+│                        HARDWARE LAYER                               │
+│     Cortex-A55 (x2)  |  Ethos-U65 NPU  |  Camera  |  Display       │
+└─────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+3. COMPONENT ARCHITECTURE
+================================================================================
+
+3.1 Core Components
+-------------------
+
+DMSController (Main Orchestrator)
+  │
+  ├─► SCRFDDetector (Face Detection)
+  │     ├─ Model: scrfd_500m_full_int8_vela.tflite
+  │     ├─ Hardware: NPU (Vela-optimized)
+  │     └─ Output: Face bounding box + 5 landmarks
+  │
+  ├─► FaceRecognizer (Identity Verification)
+  │     ├─ Model: fr_int8_velaS.tflite
+  │     ├─ Hardware: NPU (Vela-optimized)
+  │     └─ Database: drivers.json
+  │
+  ├─► DriverMonitoringWrapper (Behavior Analysis)
+  │     ├─ FaceMesh: face_landmark_192_int8.tflite (CPU)
+  │     ├─ Eye Detection: eye_detection_int8_vela.tflite (NPU)
+  │     ├─ Phone Detection: detect_vela.tflite (NPU)
+  │     └─ Output: Alerts (drowsiness, phone, etc.)
+  │
+  ├─► YOLOWorker (Seatbelt/Cigarette Detection)
+  │     ├─ Model: best_640.onnx (CPU)
+  │     ├─ Classes: 6 (seatbelt_worn, no_seatbelt, cigarette_*)
+  │     └─ Mode: Periodic (every 15 seconds)
+  │
+  └─► MJPEGServer (Network Streaming)
+        ├─ Protocol: HTTP multipart/x-mixed-replace
+        ├─ Port: 8080
+        └─ Format: JPEG @ 60% quality
+
+3.2 Component Relationships
+---------------------------
+
+                    ┌───────────────────┐
+                    │  DMSController    │
+                    │  (Main Control)   │
+                    └─────────┬─────────┘
+                              │
+                ┌─────────────┼─────────────┐
+                │             │             │
+        ┌───────▼─────┐ ┌────▼─────┐ ┌────▼──────┐
+        │Face Detector│ │Face Recog│ │ Monitoring│
+        │   (SCRFD)   │ │   (FR)   │ │  Wrapper  │
+        └─────────────┘ └──────────┘ └─────┬─────┘
+                                            │
+                        ┌───────────────────┼───────────────────┐
+                        │                   │                   │
+                  ┌─────▼─────┐     ┌──────▼──────┐    ┌──────▼──────┐
+                  │ FaceMesh  │     │Eye Detection│    │Phone Detect │
+                  │ (Landmarks)│     │ (MobileNet) │    │  (SSD)      │
+                  └───────────┘     └─────────────┘    └─────────────┘
+
+        ┌──────────────────────────────────────────────┐
+        │          YOLOWorker (Separate Thread)        │
+        │     (Seatbelt/Cigarette - Periodic)          │
+        └──────────────────────────────────────────────┘
+
+3.3 Data Structures
+-------------------
+
+Detection Result:
+  {
+    'box': [x1, y1, x2, y2],
+    'landmarks': [[x, y], ...],  # 5 facial landmarks
+    'score': float,
+    'frame': numpy.ndarray
+  }
+
+Recognition Result:
+  {
+    'driver_id': int,
+    'name': str,
+    'similarity': float
+  }
+
+Monitoring Result:
+  {
+    'landmarks': numpy.ndarray,  # 468 3D landmarks
+    'crop_box': (x1, y1, x2, y2),
+    'ear': float,  # Eye Aspect Ratio
+    'mar': float,  # Mouth Aspect Ratio
+    'alerts': [(severity, message), ...]
+  }
+
+YOLO Detection:
+  {
+    'box': [x1, y1, x2, y2],
+    'conf': float,
+    'cls': int,
+    'name': str  # Class name
+  }
+
+================================================================================
+4. MULTI-THREADING DESIGN
+================================================================================
+
+4.1 Thread Architecture
+-----------------------
+
+Thread 1: Main Loop (Primary Thread)
+  ├─ Responsibilities:
+  │   ├─ Camera frame capture (V4L2)
+  │   ├─ Frame skip logic (66% reduction)
+  │   ├─ Queue management (frame_queue)
+  │   ├─ UI rendering
+  │   └─ MJPEG frame updates
+  ├─ CPU Affinity: Core 0
+  ├─ CPU Usage: 9-12%
+  └─ Frame Rate: 10 FPS
+
+Thread 2: Detection Thread (Daemon)
+  ├─ Responsibilities:
+  │   ├─ Face detection (SCRFD on NPU)
+  │   ├─ Bounding box extraction
+  │   ├─ Landmark extraction (5 points)
+  │   └─ Frame decimation (50% in monitoring)
+  ├─ CPU Affinity: Core 1
+  ├─ CPU Usage: 5-8%
+  └─ Processing Rate: 5 FPS (monitoring), 10 FPS (recognizing)
+
+Thread 3: Recognition Thread (Daemon, Conditional)
+  ├─ Responsibilities:
+  │   ├─ Face recognition (FR model on NPU)
+  │   ├─ Driver database lookup
+  │   └─ Identity verification
+  ├─ Lifecycle: Active only in RECOGNIZING state, exits after match
+  ├─ CPU Usage: 0% (after recognition complete)
+  └─ Processing Rate: 10 FPS (when active)
+
+Thread 4: Monitoring Thread (Daemon, Conditional)
+  ├─ Responsibilities:
+  │   ├─ FaceMesh landmark detection (CPU)
+  │   ├─ Eye state detection (NPU)
+  │   ├─ Phone detection (NPU)
+  │   ├─ Drowsiness analysis
+  │   ├─ Seatbelt/cigarette processing
+  │   └─ Alert generation
+  ├─ Lifecycle: Active only in MONITORING state
+  ├─ CPU Affinity: Core 0 (FaceMesh), Core 1 (NPU models)
+  ├─ CPU Usage: 35-50%
+  └─ Processing Rate: 5 FPS
+
+Thread 5: YOLO Worker (Daemon, Background)
+  ├─ Responsibilities:
+  │   ├─ Periodic wake-up (every 15 seconds)
+  │   ├─ ONNX inference (seatbelt/cigarette)
+  │   ├─ NMS post-processing
+  │   └─ Event-based synchronization
+  ├─ CPU Affinity: Core 1
+  ├─ CPU Usage: 3% average, 20-25% spike
+  └─ Processing Rate: 0.067 FPS (1 frame per 15s)
+
+Thread 6: MJPEG Server (Daemon, Background)
+  ├─ Responsibilities:
+  │   ├─ HTTP server (port 8080)
+  │   ├─ JPEG encoding (quality 60%)
+  │   ├─ Network streaming
+  │   └─ Client connection management
+  ├─ CPU Affinity: Core 1
+  ├─ CPU Usage: 2-3%
+  └─ Streaming Rate: 30 FPS (limited by sleep)
+
+4.2 Thread Synchronization
+--------------------------
+
+Synchronization Primitives:
+  - Queue-based communication (thread-safe)
+  - Event-based wake (YOLO worker)
+  - Lock-based protection (shared data)
+
+Queues:
+  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+  │frame_queue   │ ───► │detection_queue│ ───► │result_queue  │
+  │(maxsize=1)   │      │(maxsize=2)    │      │(maxsize=3)   │
+  └──────────────┘      └──────────────┘      └──────────────┘
+   Main → Detection     Detection → Recog/Mon  Recog/Mon → Main
+
+Shared Resources:
+  - self.latest_frame (YOLO worker) - Protected by frame_lock
+  - self.latest_dets (YOLO results) - Protected by lock
+  - self.seatbelt_history - Thread-local (monitoring only)
+  - self.active_alerts - Thread-local (main only)
+
+4.3 Thread Lifecycle
+--------------------
+
+System Startup:
+  1. Main thread starts
+  2. Initialize models (NPU/CPU)
+  3. Start MJPEG server (daemon)
+  4. Start Detection thread (daemon)
+  5. Start Recognition thread (daemon)
+  6. Start YOLO worker (daemon)
+  7. Enter main loop
+
+State Transitions:
+  DETECTING → RECOGNIZING:
+    - Recognition thread activated
+    - Processes face detection queue
+
+  RECOGNIZING → MONITORING:
+    - Recognition thread exits
+    - Monitoring thread spawned
+    - YOLO worker begins periodic detection
+
+  MONITORING → RECOGNIZING:
+    - Face lost for 30 frames
+    - Monitoring thread exits
+    - New recognition thread spawned
+
+System Shutdown:
+  1. Set self.running = False
+  2. Threads exit gracefully (daemon)
+  3. YOLO worker stops
+  4. MJPEG server shuts down
+  5. Release camera
+  6. Clean up resources
+
+================================================================================
+5. DATA FLOW DIAGRAM
+================================================================================
+
+5.1 Main Processing Pipeline
+-----------------------------
+
+Camera (30 FPS)
+    │
+    ▼
+┌─────────────────┐
+│  Main Thread    │ Frame skip (66%)
+│  Frame Skip     │ ───────────────────┐
+└────────┬────────┘                    │ (Dropped)
+         │ (10 FPS)                    ▼
+         ▼                          Discard
+┌─────────────────┐
+│  frame_queue    │ (maxsize=1)
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Detection Thread│ SCRFD on NPU
+│  Face Detection │ Decimation (50% in monitoring)
+└────────┬────────┘
+         │ (5-10 FPS)
+         ▼
+┌─────────────────┐
+│detection_queue  │ (maxsize=2)
+└────────┬────────┘
+         │
+         ├──────────────────┬──────────────────┐
+         │                  │                  │
+         ▼                  ▼                  ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│ Recognition   │  │  Monitoring   │  │  (State-based)│
+│    Thread     │  │    Thread     │  │               │
+│  (FR Model)   │  │ (Multi-Model) │  │               │
+└───────┬───────┘  └───────┬───────┘  └───────────────┘
+        │                  │
+        │                  ├──────┬──────┬──────┐
+        │                  │      │      │      │
+        │                  ▼      ▼      ▼      ▼
+        │            ┌─────────┐ ┌────┐ ┌────┐ ┌────┐
+        │            │FaceMesh │ │Eye │ │Phone│ │YOLO│
+        │            │  (CPU)  │ │(NPU)│ │(NPU)│ │    │
+        │            └─────────┘ └────┘ └────┘ └──┬─┘
+        │                  │      │      │        │
+        │                  └──────┴──────┴────────┘
+        │                          │
+        │                          ▼
+        │                  ┌───────────────┐
+        │                  │   Analysis    │
+        │                  │   & Alerts    │
+        │                  └───────┬───────┘
+        │                          │
+        ▼                          ▼
+┌──────────────────────────────────────┐
+│         result_queue (maxsize=3)     │
+└────────────────┬─────────────────────┘
+                 │
+                 ▼
+         ┌───────────────┐
+         │  Main Thread  │
+         │  UI Display   │
+         │  MJPEG Update │
+         └───────────────┘
+
+5.2 YOLO Parallel Pipeline
+--------------------------
+
+┌─────────────────┐
+│  Main Thread    │
+│  (10 FPS)       │
+└────────┬────────┘
+         │
+         │ submit(frame)  # Non-blocking reference
+         ├────────────────────────►┌─────────────────┐
+         │                         │  YOLO Worker    │
+         │                         │  (Background)   │
+         │                         └────────┬────────┘
+         │                                  │
+         │                         ┌────────▼────────┐
+         │                         │  Event.wait()   │
+         │                         │  (15 seconds)   │
+         │                         └────────┬────────┘
+         │                                  │
+         │                         ┌────────▼────────┐
+         │                         │ ONNX Inference  │
+         │                         │   (250-300ms)   │
+         │                         └────────┬────────┘
+         │                                  │
+         │                         ┌────────▼────────┐
+         │                         │  NMS + Filter   │
+         │                         └────────┬────────┘
+         │                                  │
+         │                         ┌────────▼────────┐
+         │                         │ Store Results   │
+         │                         │ (thread-safe)   │
+         │                         └─────────────────┘
+         │
+         │ get_latest()  # Retrieve results
+         ◄────────────────────────────────────────────
+
+5.3 MJPEG Streaming Pipeline
+----------------------------
+
+┌─────────────────┐
+│  Main Thread    │
+│  (10 FPS)       │
+└────────┬────────┘
+         │
+         │ update_frame(display_frame)
+         ▼
+┌─────────────────┐
+│ MJPEG Server    │
+│  current_frame  │
+└────────┬────────┘
+         │
+         │ HTTP Request from Client
+         ▼
+┌─────────────────┐
+│ JPEG Encoder    │
+│  (quality 60%)  │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Network Socket  │
+│  (Port 8080)    │
+└────────┬────────┘
+         │
+         ▼
+     VLC Player
+   (Remote Viewer)
+
+================================================================================
+6. HARDWARE UTILIZATION
+================================================================================
+
+6.1 NPU (Ethos-U65) Workload
+-----------------------------
+
+Vela-Optimized Models:
+  1. SCRFD Face Detection
+     - Input: 640×480 BGR
+     - Operations: ~50 MOps
+     - Time: 40-60ms
+     - Frequency: 5 FPS
+
+  2. Face Recognition
+     - Input: 112×112 aligned face
+     - Operations: ~30 MOps
+     - Time: 30-50ms
+     - Frequency: 10 FPS (only in RECOGNIZING state)
+
+  3. Eye Detection (MobileNetV2)
+     - Input: 224×224 RGB
+     - Operations: ~25 MOps
+     - Time: 25-35ms
+     - Frequency: 2.5 FPS (50% skip)
+
+  4. Phone Detection (SSD MobileNet)
+     - Input: 300×300 RGB
+     - Operations: ~30 MOps
+     - Time: 30-40ms
+     - Frequency: 1.7 FPS (66% skip)
+
+Total NPU Utilization:
+  - Peak: ~135 MOps per frame
+  - Average: ~70 MOps per frame (with frame skipping)
+  - Utilization: ~60% (4 of 6 models on NPU)
+
+6.2 CPU (Cortex-A55) Workload
+-----------------------------
+
+Core 0 Workload:
+  - Main thread: 10%
+  - FaceMesh inference: 35-40%
+  - Eye/Phone preprocessing: 5%
+  - Total: ~50-55%
+
+Core 1 Workload:
+  - Detection thread: 5%
+  - YOLO inference: 3% avg, 25% spike
+  - MJPEG encoding: 3%
+  - Total: ~11-33% (avg), ~33-60% (during YOLO)
+
+Multi-Core Total:
+  - Average: 61-88% (30-44% per core)
+  - Peak: 100-120% (50-60% per core during YOLO)
+
+6.3 Memory Utilization
+---------------------
+
+Static Memory (Models):
+  - SCRFD: 15 MB
+  - Face Recognition: 8 MB
+  - FaceMesh: 12 MB
+  - Eye Detection: 6 MB
+  - Phone Detection: 10 MB
+  - YOLO: 45 MB
+  - Total: 96 MB
+
+Dynamic Memory (Runtime):
+  - Frame buffers (6 frames): 12 MB
+  - Python runtime: 80 MB
+  - Libraries (OpenCV, TFLite, ONNX): 36 MB
+  - Total: 128 MB
+
+Total Process Memory: 227 MB (11.8% of 1911 MB system RAM)
+
+6.4 Camera Utilization
+---------------------
+
+V4L2 Interface:
+  - Resolution: 640×480 @ 30 FPS
+  - Format: YUYV/MJPEG
+  - Bandwidth: ~27 MB/s (uncompressed)
+  - Buffer: 4 frames (kernel-space)
+
+Processing:
+  - Capture: 30 FPS
+  - Skip: 66% (process every 3rd frame)
+  - Effective: 10 FPS processing
+
+================================================================================
+7. MODEL PIPELINE
+================================================================================
+
+7.1 Face Detection Pipeline (SCRFD)
+-----------------------------------
+
+Input: 640×480 BGR frame
+  │
+  ├─► Preprocessing (CPU):
+  │     - Resize (if needed)
+  │     - Normalize [0-255] → [-1, 1]
+  │     - Quantize to INT8
+  │
+  ├─► NPU Inference (Ethos-U65):
+  │     - Feature extraction (backbone)
+  │     - Multi-scale detection
+  │     - Output: 3160 anchors × (box + score)
+  │
+  └─► Post-processing (CPU):
+        - Score filtering (threshold: 0.70)
+        - NMS (IoU threshold: 0.45)
+        - Landmark extraction (5 points)
+        - Output: [{box, landmarks, score}]
+
+7.2 Face Recognition Pipeline
+-----------------------------
+
+Input: Detection result (box + landmarks)
+  │
+  ├─► Face Alignment (CPU):
+  │     - Affine transformation
+  │     - Crop to 112×112
+  │     - Normalize
+  │
+  ├─► NPU Inference (Ethos-U65):
+  │     - Feature extraction
+  │     - Output: 512-dim embedding
+  │
+  └─► Similarity Matching (CPU):
+        - Cosine distance with database
+        - Threshold: 0.55
+        - Output: {driver_id, name, similarity}
+
+7.3 FaceMesh Pipeline
+--------------------
+
+Input: Face crop (expanded bbox)
+  │
+  ├─► Preprocessing (CPU):
+  │     - Resize to 192×192
+  │     - BGR → RGB
+  │     - Normalize [0, 1]
+  │     - Quantize to INT8
+  │
+  ├─► CPU Inference (TFLite):
+  │     - MobileNetV2-based architecture
+  │     - Output: 468×3 landmarks (quantized)
+  │
+  └─► Post-processing (CPU):
+        - Dequantize
+        - Reshape (468, 3)
+        - Normalize to [0, 1]
+        - Output: 468 3D facial landmarks
+
+7.4 Eye Detection Pipeline
+--------------------------
+
+Input: Face crop
+  │
+  ├─► Preprocessing (CPU):
+  │     - Resize to 256×256
+  │     - Center crop to 224×224
+  │     - BGR → RGB
+  │     - Normalize [0, 1]
+  │     - Quantize to INT8
+  │
+  ├─► NPU Inference (Ethos-U65):
+  │     - MobileNetV2 feature extraction
+  │     - Binary classification
+  │     - Output: [closed, open] logits
+  │
+  └─► Post-processing (CPU):
+        - Dequantize
+        - Softmax activation
+        - ArgMax prediction
+        - Output: {is_open, confidence}
+
+7.5 Phone Detection Pipeline
+----------------------------
+
+Input: Full frame (640×480)
+  │
+  ├─► Preprocessing (CPU):
+  │     - Resize to 300×300
+  │     - BGR → RGB
+  │     - Keep as UINT8
+  │
+  ├─► NPU Inference (Ethos-U65):
+  │     - SSD MobileNet architecture
+  │     - Output: boxes, classes, scores
+  │
+  └─► Post-processing (CPU):
+        - Filter phone class IDs [77, 76, 73, 74]
+        - Confidence threshold: 0.35
+        - Position analysis (relative to face)
+        - Temporal filtering (3 consecutive frames)
+        - Output: {texting, call, position}
+
+7.6 YOLO Pipeline
+----------------
+
+Input: Frame (640×480)
+  │
+  ├─► Preprocessing (CPU):
+  │     - Letterbox resize to 640×640
+  │     - BGR → RGB
+  │     - Normalize [0, 1]
+  │     - Transpose to NCHW
+  │
+  ├─► CPU Inference (ONNX Runtime):
+  │     - YOLOv5/v8 architecture
+  │     - Output: (1, 8400, 11) predictions
+  │
+  └─► Post-processing (CPU):
+        - Sigmoid activation (objectness + class scores)
+        - Box coordinate conversion (cx,cy,w,h → x1,y1,x2,y2)
+        - Class-wise thresholding
+        - NMS (IoU: 0.45)
+        - Coordinate scaling (640 → 480)
+        - ROI filtering (chest/face regions)
+        - Output: [{box, conf, cls, name}]
+
+================================================================================
+8. STATE MACHINE
+================================================================================
+
+8.1 System States
+----------------
+
+┌──────────────┐
+│  DETECTING   │  Initial state (camera check)
+└──────┬───────┘
+       │
+       │ Camera opened
+       ▼
+┌──────────────┐
+│ RECOGNIZING  │  Waiting for driver identification
+└──────┬───────┘
+       │
+       │ Driver recognized
+       ▼
+┌──────────────┐
+│ MONITORING   │  Active driver monitoring
+└──────┬───────┘
+       │
+       │ Face lost (30 frames)
+       ├──────────────────┐
+       │                  │
+       ▼                  │
+┌──────────────┐          │
+│ RECOGNIZING  │◄─────────┘
+└──────────────┘
+
+       │ Unknown driver detected
+       ▼
+┌──────────────┐
+│  ENROLLING   │  Manual enrollment required
+└──────────────┘
+
+8.2 State Transitions
+---------------------
+
+DETECTING → RECOGNIZING:
+  - Trigger: Camera successfully opened
+  - Actions:
+      • Start detection thread
+      • Start recognition thread
+      • Display "Looking for face..."
+
+RECOGNIZING → MONITORING:
+  - Trigger: Driver recognized (similarity > 0.55)
+  - Actions:
+      • Exit recognition thread
+      • Start monitoring thread
+      • Reset monitoring state
+      • Print driver name
+      • Start YOLO worker submissions
+
+RECOGNIZING → ENROLLING:
+  - Trigger: Unknown face for >15 frames
+  - Actions:
+      • Stop recognition
+      • Display enrollment message
+      • Wait for manual enrollment
+
+MONITORING → RECOGNIZING:
+  - Trigger: Face lost for >30 frames
+  - Actions:
+      • Exit monitoring thread
+      • Clear monitoring state
+      • Start new recognition thread
+      • Display "Face lost"
+
+8.3 Thread Lifecycle by State
+-----------------------------
+
+State         Main  Detection  Recognition  Monitoring  YOLO
+-----------   ----  ---------  -----------  ----------  ----
+DETECTING     RUN   STOP       STOP         STOP        STOP
+RECOGNIZING   RUN   RUN        RUN          STOP        RUN*
+MONITORING    RUN   RUN        STOP         RUN         RUN
+ENROLLING     RUN   RUN        STOP         STOP        RUN
+
+* YOLO runs in background but submissions only occur in MONITORING
+
+================================================================================
+9. COMMUNICATION ARCHITECTURE
+================================================================================
+
+9.1 Inter-Thread Communication
+------------------------------
+
+Queue-Based:
+  Main Thread → Detection Thread:
+    - Queue: frame_queue (maxsize=1)
+    - Data: numpy.ndarray (640×480×3)
+    - Frequency: 10 FPS
+    - Blocking: Yes (timeout=0.1s)
+
+  Detection Thread → Recognition Thread:
+    - Queue: detection_queue (maxsize=2)
+    - Data: {box, landmarks, score, frame}
+    - Frequency: 5-10 FPS
+    - Blocking: Yes (timeout=0.1s)
+
+  Detection Thread → Monitoring Thread:
+    - Queue: detection_queue (maxsize=2)
+    - Data: {box, landmarks, score, frame}
+    - Frequency: 5 FPS
+    - Blocking: Yes (timeout=0.15s)
+
+  Recognition/Monitoring → Main Thread:
+    - Queue: result_queue (maxsize=3)
+    - Data: {type, data, ...}
+    - Frequency: 5-10 FPS
+    - Blocking: No (get_nowait)
+
+Event-Based:
+  Main Thread → YOLO Worker:
+    - Mechanism: Direct reference (self.latest_frame)
+    - Synchronization: frame_lock (threading.Lock)
+    - Frequency: Async (10 FPS submission, 0.067 FPS processing)
+
+  YOLO Worker → Monitoring Thread:
+    - Mechanism: Direct reference (self.latest_dets)
+    - Synchronization: lock (threading.Lock)
+    - Frequency: Async (read on demand)
+
+Shared Memory:
+  Main Thread → MJPEG Server:
+    - Mechanism: Direct reference (server.current_frame)
+    - Synchronization: None (read-only from server)
+    - Frequency: 10 FPS update, 30 FPS read
+
+9.2 Network Communication
+-------------------------
+
+MJPEG Streaming:
+  Protocol: HTTP/1.1
+  Content-Type: multipart/x-mixed-replace; boundary=--jpgboundary
+  Port: 8080
+  Path: /video
+  Format: Motion JPEG
+  Quality: 60%
+  Frame Rate: 30 FPS (limited by sleep)
+
+Client Connection:
+  URL: http://<board-ip>:8080/video
+  Viewer: VLC, ffplay, web browser
+  Bandwidth: ~100-200 KB/s per client
+
+================================================================================
+10. FILE STRUCTURE
+================================================================================
+
+10.1 Project Directory
+---------------------
+
+DMS_with yolo(npu)/
+│
+├── main_board.py                    # Main controller (1968 lines)
+│   ├─ DMSController class
+│   ├─ YOLOWorker class
+│   ├─ DriverMonitoringWrapper class
+│   ├─ MJPEGServer class
+│   └─ Helper functions
+│
+├── scrfd_detector_board.py          # SCRFD face detector wrapper
+│   ├─ SCRFDDetector class
+│   ├─ align_face() function
+│   └─ NPU delegate loading
+│
+├── recognize_v2_board.py            # Face recognition wrapper
+│   ├─ FaceRecognizer class
+│   ├─ Database management
+│   └─ Embedding comparison
+│
+├── enroll_industrial_board.py      # Enrollment script
+│   └─ Interactive driver registration
+│
+├── monitor_system.py                # System monitoring script
+│   └─ CPU/memory/NPU stats
+│
+├── check_tensors.py                 # Model verification utility
+│
+├── Models/
+│   ├── scrfd_500m_full_int8_vela.tflite    # Face detection (NPU)
+│   ├── fr_int8_velaS.tflite                # Face recognition (NPU)
+│   ├── face_landmark_192_int8.tflite       # FaceMesh (CPU)
+│   ├── eye_detection_int8_vela.tflite      # Eye detection (NPU)
+│   ├── detect_vela.tflite                  # Phone detection (NPU)
+│   └── best_640.onnx                       # YOLO seatbelt/cigarette (CPU)
+│
+├── drivers.json                     # Face recognition database
+│
+├── CPU_Usage_Report.txt             # Performance report
+│
+├── DMS_Architecture.txt             # This file
+│
+└── __pycache__/                     # Python bytecode cache
+
+10.2 Module Dependencies
+-----------------------
+
+main_board.py:
+  ├─ cv2 (OpenCV)
+  ├─ numpy
+  ├─ time
+  ├─ threading
+  ├─ queue
+  ├─ subprocess
+  ├─ sys, os, re
+  ├─ collections (deque, defaultdict)
+  ├─ datetime
+  ├─ typing
+  ├─ http.server, socketserver
+  ├─ io.BytesIO
+  ├─ tflite_runtime.interpreter (or tensorflow.lite)
+  ├─ ultralytics (YOLO) - optional
+  ├─ onnxruntime - for YOLO
+  ├─ scrfd_detector_board (SCRFDDetector, align_face)
+  └─ recognize_v2_board (FaceRecognizer)
+
+scrfd_detector_board.py:
+  ├─ cv2
+  ├─ numpy
+  └─ tflite_runtime.interpreter
+
+recognize_v2_board.py:
+  ├─ cv2
+  ├─ numpy
+  ├─ json
+  ├─ tflite_runtime.interpreter
+  └─ scrfd_detector_board
+
+10.3 Configuration Files
+------------------------
+
+drivers.json Structure:
+  {
+    "drivers": [
+      {
+        "id": 1,
+        "name": "Driver Name",
+        "embedding": [512 floats],
+        "enrolled_date": "2025-12-30"
+      }
+    ]
+  }
+
+Class Thresholds (in main_board.py):
+  {
+    'seatbelt_worn': 0.25,
+    'no_seatbelt': 0.20,
+    'cigarette_hand': 0.30,
+    'cigarette_mouth': 0.30,
+    'no_cigarette': 0.20
+  }
+
+================================================================================
+11. PERFORMANCE ARCHITECTURE
+================================================================================
+
+11.1 Optimization Strategies
+----------------------------
+
+Frame-Level Optimizations:
+  1. Frame Skip (Main Loop):
+     - Strategy: Process every 3rd frame (66% skip)
+     - Reduction: 30 FPS → 10 FPS
+     - CPU Saved: ~10%
+
+  2. Detection Decimation (Monitoring):
+     - Strategy: Skip every other frame in monitoring
+     - Reduction: 10 FPS → 5 FPS
+     - CPU Saved: ~7%
+
+  3. Eye Detection Skip:
+     - Strategy: Process every other frame
+     - Reduction: 5 FPS → 2.5 FPS
+     - CPU Saved: ~3%
+
+  4. Phone Detection Skip:
+     - Strategy: Process every 3rd frame
+     - Reduction: 5 FPS → 1.7 FPS
+     - CPU Saved: ~4%
+
+Model-Level Optimizations:
+  1. NPU Offloading:
+     - Strategy: Use Vela-optimized models
+     - Models: 4 of 6 on NPU
+     - CPU Saved: ~30%
+
+  2. Quantization:
+     - Strategy: All models INT8
+     - Accuracy Trade-off: <1%
+     - Speed Gain: 4×
+
+  3. Resolution Reduction:
+     - Eye: 256→224 (center crop)
+     - Phone: 640→300
+     - FaceMesh: 640→192
+
+Thread-Level Optimizations:
+  1. Queue Size Reduction:
+     - Strategy: Small buffers (1-3 items)
+     - Memory Saved: ~8 MB
+     - Latency Reduced: <100ms
+
+  2. CPU Yielding:
+     - Strategy: time.sleep(0.02) in loops
+     - Context Switches: Reduced
+     - CPU Saved: ~2%
+
+  3. Event-Based Wake:
+     - Strategy: Event.wait() instead of polling
+     - CPU Saved: ~5%
+
+Inference-Level Optimizations:
+  1. YOLO Periodic Mode:
+     - Strategy: Run every 15s instead of every frame
+     - CPU Saved: ~18%
+
+  2. Batch Processing:
+     - Strategy: None (real-time requirement)
+
+  3. Early Exit:
+     - Recognition thread exits after match
+     - CPU Saved: ~6% in monitoring
+
+11.2 Performance Targets
+------------------------
+
+Latency Targets:
+  - Face Detection: <100ms
+  - Face Recognition: <150ms
+  - Monitoring (per frame): <200ms
+  - Alert Response: <300ms
+
+Throughput Targets:
+  - Main Loop: 10 FPS
+  - Detection: 5 FPS
+  - Monitoring: 5 FPS
+  - YOLO: 0.067 FPS
+
+Resource Targets:
+  - CPU: <120% (multi-core)
+  - Memory: <400 MB
+  - Load Average: <2.0
+
+Achieved Performance:
+  ✓ Latency: 100-200ms (meets target)
+  ✓ Throughput: 10 FPS main, 5 FPS monitoring (meets target)
+  ✓ CPU: 100-120% peak (meets target)
+  ✓ Memory: 227 MB (meets target)
+  ✓ Load: 1.27-1.49 (meets target)
+
+================================================================================
+12. MEMORY ARCHITECTURE
+================================================================================
+
+12.1 Memory Layout
+-----------------
+
+Stack Memory (per thread):
+  - Main Thread: ~1 MB
+  - Detection Thread: ~1 MB
+  - Recognition Thread: ~1 MB (when active)
+  - Monitoring Thread: ~2 MB
+  - YOLO Worker: ~2 MB
+  - MJPEG Server: ~1 MB
+  Total: ~8-9 MB
+
+Heap Memory:
+  Model Weights: 96 MB
+  Frame Buffers: 12 MB
+  Python Objects: 80 MB
+  Libraries: 36 MB
+  Total: ~224 MB
+
+Shared Memory:
+  - NPU memory-mapped registers: ~4 MB
+  - V4L2 buffers (kernel): ~8 MB
+
+Total Process Memory: 227 MB RSS
+
+12.2 Buffer Management
+---------------------
+
+Frame Buffers:
+  - Camera capture buffer: 640×480×3 = 921,600 bytes
+  - Queue buffers (6 frames): ~6 MB
+  - MJPEG encode buffer: 640×480×3 = 921,600 bytes
+  - YOLO letterbox buffer: 640×640×3 = 1,228,800 bytes
+
+Model Buffers:
+  - NPU scratch memory: Managed by delegate
+  - CPU inference buffers: ~10 MB total
+
+12.3 Memory Access Patterns
+---------------------------
+
+Read-Heavy:
+  - Model weights (read-only)
+  - Python bytecode (read-only)
+  - Shared libraries (read-only)
+
+Write-Heavy:
+  - Frame buffers (overwritten each frame)
+  - Detection results (updated 5-10 FPS)
+  - Alert history (updated on events)
+
+Copy-on-Write:
+  - Frame references (no copy in YOLO submit)
+  - Detection results (shallow copy to queue)
+
+================================================================================
+13. DEPLOYMENT ARCHITECTURE
+================================================================================
+
+13.1 Hardware Requirements
+-------------------------
+
+Minimum:
+  - CPU: Dual-core ARM Cortex-A55 @ 1.5 GHz
+  - NPU: ARM Ethos-U65 or equivalent
+  - RAM: 2 GB DDR4
+  - Storage: 1 GB (for models + OS)
+  - Camera: USB/CSI @ 640×480, 30 FPS
+
+Recommended:
+  - CPU: Dual-core ARM Cortex-A55 @ 1.7 GHz
+  - NPU: ARM Ethos-U65 (256 MACs)
+  - RAM: 2 GB DDR4
+  - Storage: 2 GB (for logs + database)
+  - Camera: USB/CSI @ 640×480, 30 FPS
+  - Network: Ethernet/WiFi (for MJPEG streaming)
+
+13.2 Software Dependencies
+--------------------------
+
+Operating System:
+  - Linux kernel 5.10+
+  - Yocto-based distribution
+  - V4L2 support
+  - Ethos-U NPU driver
+
+Python Environment:
+  - Python 3.8+
+  - pip package manager
+
+Required Packages:
+  - opencv-python >= 4.5
+  - numpy >= 1.20
+  - tflite-runtime >= 2.5 (with Ethos-U delegate)
+  - onnxruntime >= 1.10
+  - ultralytics (optional, for YOLO)
+
+Optional Packages:
+  - pyarmor (for code protection)
+  - cryptography (for model encryption)
+
+13.3 Installation Steps
+----------------------
+
+1. System Setup:
+   $ sudo apt update
+   $ sudo apt install python3-pip v4l-utils
+
+2. Install Python Dependencies:
+   $ pip3 install opencv-python numpy tflite-runtime onnxruntime
+
+3. Install NPU Delegate:
+   $ cp libethosu_delegate.so /usr/lib/
+   $ sudo ldconfig
+
+4. Copy Models:
+   $ mkdir -p /opt/dms/models
+   $ cp *.tflite *.onnx /opt/dms/models/
+
+5. Copy Code:
+   $ cp *.py /opt/dms/
+   $ chmod +x /opt/dms/main_board.py
+
+6. Create Database:
+   $ echo '{"drivers":[]}' > /opt/dms/drivers.json
+
+7. Test Camera:
+   $ v4l2-ctl --list-devices
+   $ v4l2-ctl --device=/dev/video0 --all
+
+8. Run System:
+   $ cd /opt/dms
+   $ python3 main_board.py
+
+13.4 Service Configuration
+--------------------------
+
+SystemD Service File (/etc/systemd/system/dms.service):
+  [Unit]
+  Description=Driver Monitoring System
+  After=network.target
+
+  [Service]
+  Type=simple
+  User=root
+  WorkingDirectory=/opt/dms
+  ExecStart=/usr/bin/python3 /opt/dms/main_board.py
+  Restart=on-failure
+  RestartSec=10
+
+  [Install]
+  WantedBy=multi-user.target
+
+Enable Service:
+  $ sudo systemctl daemon-reload
+  $ sudo systemctl enable dms.service
+  $ sudo systemctl start dms.service
+
+Check Status:
+  $ sudo systemctl status dms.service
+  $ journalctl -u dms.service -f
+
+13.5 Monitoring & Logging
+-------------------------
+
+System Logs:
+  - Location: /var/log/syslog
+  - DMS Output: journalctl -u dms.service
+  - NPU Logs: dmesg | grep ethos
+
+Performance Monitoring:
+  - CPU: top, htop
+  - Memory: free -h
+  - NPU: cat /sys/kernel/debug/ethosu0/inference_count
+  - Network: iftop, nethogs
+
+Application Logs:
+  - FPS: Printed to console every 5 seconds
+  - Alerts: Printed on detection
+  - Errors: stderr (captured by journalctl)
+
+================================================================================
+14. SECURITY & RELIABILITY
+================================================================================
+
+14.1 Error Handling
+------------------
+
+Camera Errors:
+  - Failure: Camera cannot be opened
+  - Handling: Print error, exit cleanly
+  - Recovery: Restart service
+
+Model Load Errors:
+  - Failure: Model file not found / corrupt
+  - Handling: Print error, exit cleanly
+  - Recovery: Verify models, restart
+
+Inference Errors:
+  - Failure: NPU inference timeout / crash
+  - Handling: Skip frame, continue processing
+  - Recovery: Automatic (next frame)
+
+Thread Errors:
+  - Failure: Thread exception
+  - Handling: Print traceback, thread exits
+  - Recovery: Main thread continues if possible
+
+Queue Errors:
+  - Failure: Queue full / timeout
+  - Handling: Skip frame, yield CPU
+  - Recovery: Automatic (queue drains)
+
+14.2 Fault Tolerance
+-------------------
+
+Watchdog:
+  - SystemD restart on failure
+  - RestartSec=10 (10 second delay)
+
+Graceful Degradation:
+  - If YOLO fails: Continue without seatbelt/cigarette detection
+  - If Eye/Phone fails: Fall back to EAR/MAR calculations
+  - If Recognition fails: Enter enrollment mode
+
+Resource Limits:
+  - Queue maxsize limits (prevent memory overflow)
+  - Frame skip (prevent CPU overload)
+  - Timeout on queue operations (prevent deadlock)
+
+14.3 Data Protection
+-------------------
+
+Driver Database:
+  - Location: drivers.json
+  - Permissions: 600 (read/write owner only)
+  - Backup: Not automatic (manual backup recommended)
+
+Model Files:
+  - Location: ./models/
+  - Permissions: 644 (read for all)
+  - Integrity: No verification (add hash check if needed)
+
+Network Security:
+  - MJPEG: No authentication (add HTTP auth if needed)
+  - Port: 8080 (firewall recommended)
+
+================================================================================
+END OF ARCHITECTURE DOCUMENT
+================================================================================
+
+For questions or updates, refer to:
+  - Source Code: main_board.py (1968 lines)
+  - Performance Report: CPU_Usage_Report.txt
+  - System Logs: journalctl -u dms.service
+
+Revision History:
+  - v1.0 (2025-12-30): Initial architecture document

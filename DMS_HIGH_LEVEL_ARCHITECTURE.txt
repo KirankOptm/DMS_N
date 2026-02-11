@@ -1,0 +1,386 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    DMS HIGH-LEVEL ARCHITECTURE OVERVIEW
+                        Driver Monitoring System (DMS)
+                             January 23, 2026
+═══════════════════════════════════════════════════════════════════════════════
+
+
+SYSTEM OVERVIEW
+═══════════════════════════════════════════════════════════════════════════════
+
+The Driver Monitoring System (DMS) is a real-time safety monitoring application
+that detects driver drowsiness, distraction, and unsafe behaviors using computer
+vision and AI models.
+
+Platform:  NXP i.MX93 Evaluation Board
+Language:  Python 3.x
+Framework: MediaPipe (face/hand detection) + YOLOv8 (object detection)
+Standard:  AIS 184 Compliance (Automotive Industry Standard)
+
+
+KEY FEATURES
+═══════════════════════════════════════════════════════════════════════════════
+
+✓ Drowsiness Detection    - Eye closure, yawning, head drooping
+✓ Distraction Detection   - Gaze direction, head turns, phone usage
+✓ Safety Monitoring       - Seatbelt detection, smoking detection
+✓ Risk Scoring            - KSS 1-9 drowsiness scale (AIS 184)
+✓ Real-time Alerts        - Buzzer, visual warnings, logs
+
+
+LAYERED ARCHITECTURE (7 LAYERS)
+═══════════════════════════════════════════════════════════════════════════════
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 7: Actions & Outputs                                 │
+    │  - Buzzer alerts, Logs, Display                             │
+    └─────────────────────────────────────────────────────────────┘
+                              ▲
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 6: Risk Assessment                                   │
+    │  - KSS Calculator (1-9 score), Alert Manager                │
+    └─────────────────────────────────────────────────────────────┘
+                              ▲
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 5: Behavior Analysis                                 │
+    │  - Eye closure, Head movement, Hand activity, Gaze          │
+    └─────────────────────────────────────────────────────────────┘
+                              ▲
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 4: Feature Extraction                                │
+    │  - EAR, MAR, Gaze angles, Head pose                         │
+    └─────────────────────────────────────────────────────────────┘
+                              ▲
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 3: AI Models (Main Thread + Worker Thread)          │
+    │  - MediaPipe (Face/Hand/Pose) + YOLOv8 (Objects)           │
+    └─────────────────────────────────────────────────────────────┘
+                              ▲
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 2: Hardware Drivers                                  │
+    │  - Camera, Buzzer, File I/O                                 │
+    └─────────────────────────────────────────────────────────────┘
+                              ▲
+    ┌─────────────────────────────────────────────────────────────┐
+    │  LAYER 1: Hardware & OS                                     │
+    │  - Camera sensor, GPIO, Linux kernel                        │
+    └─────────────────────────────────────────────────────────────┘
+
+
+LAYER DESCRIPTIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+LAYER 7: ACTIONS & OUTPUTS
+---------------------------
+What it does:  Final actions triggered by the system
+Components:    - Buzzer control (beep patterns)
+               - Alert logging (file + terminal)
+               - Video display (OpenCV window)
+               - Remote streaming (TCP)
+
+
+LAYER 6: RISK ASSESSMENT
+------------------------
+What it does:  Calculates driver drowsiness and manages alerts
+Components:    - KSS Calculator: Scores drowsiness 1-9 scale
+               - Alert Manager: Controls when/how alerts fire
+               - Critical Overrides: Instant alerts for danger
+               
+Key Thresholds:
+  • Eyes closed > 1.5s → KSS 9.0 (CRITICAL)
+  • Head nod 1-2s      → KSS 7.0 (WARNING)
+  • KSS ≥ 7.0          → Buzzer alert (AIS 184)
+
+
+LAYER 5: BEHAVIOR ANALYSIS
+--------------------------
+What it does:  Interprets human behaviors from features
+Components:    - Eye Monitoring: Closure duration, blink rate
+               - Head Analysis: Droop, turn, tilt detection
+               - Hand Activity: Phone, smoking, texting
+               - Gaze Tracking: LEFT/RIGHT/UP/DOWN
+               - Yawn Detection: Mouth opening analysis
+
+
+LAYER 4: FEATURE EXTRACTION
+---------------------------
+What it does:  Converts AI landmarks into measurable features
+Components:    - EAR: Eye Aspect Ratio (eye openness)
+               - MAR: Mouth Aspect Ratio (yawning)
+               - Gaze Angles: Iris position (2D)
+               - Head Pose: Yaw/pitch/roll angles
+
+
+LAYER 3: AI MODELS
+------------------
+What it does:  AI inference for detection and tracking
+Components:    
+  Main Thread (Real-time):
+    - MediaPipe FaceMesh: 468 facial landmarks
+    - MediaPipe Hands: Hand detection
+    - MediaPipe Pose: Body landmarks
+    
+  Worker Thread (Every 10 seconds):
+    - YOLOv8: Seatbelt, smoking, eye state detection
+
+
+LAYER 2: HARDWARE DRIVERS
+-------------------------
+What it does:  Abstracts hardware access
+Components:    - Camera interface (OpenCV)
+               - Buzzer driver (sysfs LED control)
+               - File I/O (logs, config)
+
+
+LAYER 1: HARDWARE & OS
+---------------------
+What it does:  Physical hardware and kernel interfaces
+Components:    - Camera sensor (/dev/video*)
+               - GPIO pins (LED/buzzer)
+               - Linux kernel (file system, network)
+
+
+THREADING MODEL
+═══════════════════════════════════════════════════════════════════════════════
+
+MAIN THREAD (Real-time monitoring)
+-----------------------------------
+Frequency: 0.95 FPS (1054ms per frame)
+Tasks:     1. Capture camera frame
+           2. Run MediaPipe models (face/hand/pose)
+           3. Extract features (EAR, MAR, gaze)
+           4. Analyze behaviors (eye closure, head droop)
+           5. Calculate KSS score
+           6. Trigger alerts if needed
+           7. Display video + overlays
+
+YOLO WORKER THREAD (Periodic detection)
+---------------------------------------
+Frequency: Every 10 seconds
+Tasks:     1. Receive frame from main thread (queue)
+           2. Run YOLO detection (seatbelt, smoking)
+           3. Post-process results
+           4. Send results back to main thread
+
+Communication:
+  Main → Worker:  Queue-based frame submission
+  Worker → Main:  Timestamped result polling
+
+
+DATA FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+Camera Frame
+    ↓
+MediaPipe Models (Face/Hand/Pose landmarks)
+    ↓
+Feature Extraction (EAR, MAR, Gaze, Angles)
+    ↓
+Behavior Analysis (Eye closed, Head droop, Yawn)
+    ↓
+KSS Score Calculation (1-9 scale)
+    ↓
+Alert Decision (≥7.0 triggers buzzer)
+    ↓
+Actions (Buzzer beep, Log alert, Display warning)
+
+
+KEY ALGORITHMS
+═══════════════════════════════════════════════════════════════════════════════
+
+1. EYE ASPECT RATIO (EAR)
+   - Measures eye openness from 6 landmarks per eye
+   - Threshold: < 0.18 = eyes closed
+   - Tracks closure duration for drowsiness
+
+2. MOUTH ASPECT RATIO (MAR)
+   - Measures mouth opening from 4 landmarks
+   - Threshold: > 0.6 for 4 frames = yawn detected
+
+3. GAZE TRACKING
+   - Uses iris center position (2D projection)
+   - 4 directions: LEFT, RIGHT, UP, DOWN
+   - Detects mirror checks and phone usage
+
+4. KSS CALCULATOR (Karolinska Sleepiness Scale)
+   - Multi-factor weighted scoring:
+     * PERCLOS (eye closure): 35%
+     * Average EAR: 25%
+     * Blink rate: 15%
+     * Blink duration: 10%
+     * Yawn rate: 10%
+     * Head droop: 5%
+   - Output: 1.0 (alert) to 9.0 (falling asleep)
+   - AIS 184: Alert at ≥7.0, Critical at ≥8.0
+
+
+CRITICAL ALERT RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+Rule 1: EYES CLOSED > 1.5 SECONDS
+  → Immediate KSS 9.0 (CRITICAL)
+  → Buzzer beeps 8 times
+  → Highest priority safety rule
+
+Rule 2: HEAD NOD (1-2 seconds)
+  → KSS 7.0 (WARNING)
+  → Indicates micro-sleep
+
+Rule 3: HEAD DROOP > 2 SECONDS
+  → KSS 8.0-9.0 (CRITICAL)
+  → Driver likely asleep
+
+Rule 4: KSS SCORE ≥ 7.0
+  → Buzzer alert (AIS 184 compliance)
+  → Alert logged to file
+
+
+PERFORMANCE CHARACTERISTICS
+═══════════════════════════════════════════════════════════════════════════════
+
+Frame Rate:        0.95 FPS (1054ms per frame)
+Processing Time:   
+  - MediaPipe:     909ms (86% of total) ← BOTTLENECK
+  - KSS Calc:      136ms (13%)
+  - Camera:        9ms (1%)
+  - Other:         ~10ms (1%)
+
+Latency (Eye Closure):
+  - Detection:     ~2.1 seconds (1.5s threshold + 1 frame)
+  - Alert:         Instant buzzer after detection
+
+YOLO Performance:
+  - Inference:     200-500ms
+  - Frequency:     Every 10 seconds
+  - No impact:     Runs in separate thread
+
+
+FILE STRUCTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+Core Files:
+  dms_integrated_mdp_yolo_log.py  - Main application (3200+ lines)
+  kss_calculator.py               - KSS scoring system
+  dms_latency_tracker.py          - Performance monitoring
+  gaze_tracker.py                 - Gaze direction detection
+
+Models:
+  best_640.onnx                   - YOLO seatbelt/smoking detection
+  scrfd_500m_full_int8_vela.tflite - Face detection (backup)
+  fr_int8_velaS.tflite            - Face recognition (optional)
+
+Configuration:
+  drivers.json                    - Enrolled driver database
+  DMS_LAYERED_ARCHITECTURE.txt    - Detailed architecture doc
+  KSS_SCORE_LEVELS_GUIDE.txt      - KSS scoring reference
+
+
+CONFIGURATION PARAMETERS
+═══════════════════════════════════════════════════════════════════════════════
+
+Eye Monitoring:
+  --ear-threshold 0.18            Eye closure threshold
+  --eye-closed-frames 2           Frames before "closed" alert
+  
+Head Monitoring:
+  --flip-yaw-sign                 Flip head turn direction
+  
+Gaze Detection:
+  Horizontal threshold: 0.06      Left/right sensitivity
+  Vertical threshold: 0.15        Up/down sensitivity
+
+Alert Timing:
+  Eye closure: > 1.5 seconds      Critical alert trigger
+  Head nod: 1-2 seconds           Warning trigger
+  Head droop: > 2 seconds         Critical trigger
+
+YOLO Detection:
+  Interval: 10 seconds            Detection frequency
+
+
+DEPENDENCIES
+═══════════════════════════════════════════════════════════════════════════════
+
+Python Libraries:
+  - opencv-python       Camera capture & display
+  - mediapipe           Face/hand/pose detection
+  - numpy               Numerical computations
+  - onnxruntime         YOLO inference
+
+Hardware:
+  - Camera              USB or MIPI camera
+  - LED/Buzzer          GPIO-based alert device
+  - Storage             eMMC/SD card for logs
+
+
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════════════════════
+
+Issue: Slow frame rate (< 0.5 FPS)
+Fix:   - Reduce camera resolution (640x480 → 320x240)
+       - Disable pose detection
+       - Enable frame skipping
+
+Issue: False eye closure alerts
+Fix:   - Increase EAR threshold (0.18 → 0.20)
+       - Increase duration threshold (1.5s → 2.0s)
+       - Check lighting conditions
+
+Issue: Buzzer not working
+Fix:   - Check LED sysfs path: /sys/class/leds/green:user1/brightness
+       - Verify write permissions
+       - Test with: echo 1 > /sys/class/leds/green:user1/brightness
+
+Issue: Gaze detection not accurate
+Fix:   - Run calibration (look at road for 15 seconds)
+       - Adjust horizontal/vertical thresholds
+       - Ensure proper camera positioning
+
+
+FUTURE ROADMAP
+═══════════════════════════════════════════════════════════════════════════════
+
+Performance:
+  □ Hardware acceleration (NPU support)
+  □ Model optimization (reduce MediaPipe landmarks)
+  □ Frame skipping (process every 3rd frame)
+
+Features:
+  □ Voice alerts (text-to-speech warnings)
+  □ Night mode (IR camera support)
+  □ Multi-driver profiles
+  □ Remote monitoring dashboard
+
+Safety:
+  □ Certification testing (AIS 184 full compliance)
+  □ Emergency vehicle control integration
+  □ Cloud logging and analytics
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                               QUICK REFERENCE
+═══════════════════════════════════════════════════════════════════════════════
+
+Architecture Pattern:  Layered (7 layers)
+Threading Model:       Main thread + Worker thread
+Frame Rate:            0.95 FPS (1054ms/frame)
+Alert Standard:        AIS 184 (automotive)
+KSS Scale:             1.0 (alert) to 9.0 (asleep)
+Critical Threshold:    KSS ≥ 7.0 triggers buzzer
+Eye Closure Limit:     > 1.5 seconds = KSS 9.0
+YOLO Frequency:        Every 10 seconds
+Main Bottleneck:       MediaPipe (909ms, 86%)
+
+Key Files:
+  Main:      dms_integrated_mdp_yolo_log.py
+  Scoring:   kss_calculator.py
+  Gaze:      gaze_tracker.py
+  Latency:   dms_latency_tracker.py
+
+Platform:              NXP i.MX93 Evaluation Board
+OS:                    Linux (Ubuntu/Yocto)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                                END OF DOCUMENT
+═══════════════════════════════════════════════════════════════════════════════

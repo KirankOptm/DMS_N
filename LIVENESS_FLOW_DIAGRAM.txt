@@ -1,0 +1,349 @@
+# Liveness Detection System Flow Diagram
+
+## Authentication Flow with Anti-Spoofing
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║                    DMS STARTUP (with --enable_auth)              ║
+╚══════════════════════════════════════════════════════════════════╝
+                              │
+                              ↓
+┌──────────────────────────────────────────────────────────────────┐
+│  1. INITIALIZE AUTHENTICATION SYSTEM                             │
+│     • Load SCRFD detector (NPU)                                  │
+│     • Load Face Recognizer (NPU)                                 │
+│     • Load enrolled drivers database (drivers.json)              │
+│     • Initialize LivenessDetector (MediaPipe/SCRFD)              │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+┌──────────────────────────────────────────────────────────────────┐
+│  2. START CAMERA CAPTURE (10s timeout window)                    │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+                     ┌────────┴────────┐
+                     │  FACE DETECTED? │
+                     └────────┬────────┘
+                              │
+                 ┌────────────┴────────────┐
+                 │ NO                      │ YES
+                 ↓                         ↓
+        ┌────────────────┐      ┌──────────────────────┐
+        │ Wait for face  │      │ 3. LIVENESS CHECKS   │
+        │ (timeout 10s)  │      │    (Parallel)        │
+        └────────────────┘      └──────────────────────┘
+                 │                        │
+                 │                        ↓
+                 │              ┌──────────────────────┐
+                 │              │ Check 1: Eye Blinks  │
+                 │              │ • Track EAR ratio    │
+                 │              │ • Count blinks       │
+                 │              │ • Min: 2 blinks      │
+                 │              └──────────┬───────────┘
+                 │                         │
+                 │                         ↓
+                 │              ┌──────────────────────┐
+                 │              │ Check 2: Head Pose   │
+                 │              │ • Track yaw/pitch    │
+                 │              │ • Compute variation  │
+                 │              │ • Threshold: >3°     │
+                 │              └──────────┬───────────┘
+                 │                         │
+                 │                         ↓
+                 │              ┌──────────────────────┐
+                 │              │ Check 3: Micro-Motion│
+                 │              │ • Track landmarks    │
+                 │              │ • Motion vectors     │
+                 │              │ • Threshold: >0.8px  │
+                 │              └──────────┬───────────┘
+                 │                         │
+                 │                         ↓
+                 │              ┌──────────────────────┐
+                 │              │ Liveness Score       │
+                 │              │ (2 out of 3 pass?)   │
+                 │              └──────────┬───────────┘
+                 │                         │
+                 │                    ┌────┴────┐
+                 │                    │ SCORE?  │
+                 │                    └────┬────┘
+                 │                         │
+                 │          ┌──────────────┴──────────────┐
+                 │          │ < 2                         │ >= 2
+                 │          ↓                             ↓
+                 │  ┌──────────────────┐      ┌──────────────────────┐
+                 │  │ Liveness FAILED  │      │ 4. Liveness PASSED   │
+                 │  │ (Photo/Video     │      │    Proceed to Face   │
+                 │  │  Spoofing)       │      │    Recognition       │
+                 │  └──────────────────┘      └──────────┬───────────┘
+                 │          │                             │
+                 └──────────┤                             ↓
+                            │              ┌──────────────────────────┐
+                            │              │ 5. FACE RECOGNITION      │
+                            │              │    • Align face          │
+                            │              │    • Extract embedding   │
+                            │              │    • Compare with DB     │
+                            │              │    • Compute similarity  │
+                            │              └──────────┬───────────────┘
+                            │                         │
+                            │                    ┌────┴────┐
+                            │                    │ MATCH?  │
+                            │                    └────┬────┘
+                            │                         │
+                            │          ┌──────────────┴──────────────┐
+                            │          │ NO                          │ YES
+                            │          ↓                             ↓
+                            │  ┌─────────────────┐      ┌────────────────────────┐
+                            │  │ Unknown Person  │      │ 6. ✓ AUTHENTICATED     │
+                            │  │ (Timeout)       │      │    Driver: <name>       │
+                            │  └─────────────────┘      │    ID: <id>             │
+                            │          │                │    Similarity: XX%      │
+                            │          │                │    Liveness: VERIFIED   │
+                            │          │                └────────────┬───────────┘
+                            │          │                             │
+                            ↓          ↓                             ↓
+                 ┌──────────────────────────────────────────────────────┐
+                 │ 7. ✗ AUTHENTICATION FAILED                           │
+                 │    • Liveness timeout (photo/video detected)         │
+                 │    • Unknown person                                  │
+                 │    • No face detected                                │
+                 │                                                      │
+                 │    → Proceed in UNAUTHORIZED mode                    │
+                 └──────────────────────────────────────────────────────┘
+                                      │
+                                      ↓
+                 ┌──────────────────────────────────────────────────────┐
+                 │ 8. START DMS MONITORING                              │
+                 │    • Drowsiness detection                            │
+                 │    • Gaze tracking                                   │
+                 │    • Phone/texting detection                         │
+                 │    • Seatbelt detection (YOLO)                       │
+                 │    • Smoking detection                               │
+                 │    • KSS scoring (AIS 184)                           │
+                 └──────────────────────────────────────────────────────┘
+```
+
+---
+
+## Liveness Detection Algorithm Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  FRAME N: Face Detected                                         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  Extract Facial Landmarks                                       │
+│  • MediaPipe: 468 points (full mode)                            │
+│  • SCRFD: 5 keypoints (fallback mode)                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         │                    │                    │
+         ↓                    ↓                    ↓
+┌────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+│ Eye Blink      │  │ Head Pose        │  │ Micro-Motion    │
+│ Detection      │  │ Tracking         │  │ Analysis        │
+└────────────────┘  └──────────────────┘  └─────────────────┘
+         │                    │                    │
+         ↓                    ↓                    ↓
+┌────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+│ Compute EAR    │  │ Compute Angles   │  │ Motion Vectors  │
+│ (Eye Aspect    │  │ yaw = arctan2()  │  │ current - prev  │
+│  Ratio)        │  │ pitch = arctan2()│  │                 │
+└────────────────┘  └──────────────────┘  └─────────────────┘
+         │                    │                    │
+         ↓                    ↓                    ↓
+┌────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+│ EAR < 0.21?    │  │ Add to           │  │ avg_magnitude   │
+│ → ear_counter++│  │ pose_history[30] │  │ → buffer[15]    │
+└────────────────┘  └──────────────────┘  └─────────────────┘
+         │                    │                    │
+         ↓                    ↓                    ↓
+┌────────────────┐  ┌──────────────────┐  ┌─────────────────┐
+│ ear_counter    │  │ std(yaw) > 3° OR │  │ avg(buffer)     │
+│ >= 2 frames?   │  │ std(pitch) > 3°? │  │ > 0.8 pixels?   │
+│ → blink_count++│  │ → head_moved=True│  │ → motion=True   │
+└────────────────┘  └──────────────────┘  └─────────────────┘
+         │                    │                    │
+         └────────────────────┼────────────────────┘
+                              ↓
+                   ┌──────────────────────┐
+                   │  Liveness Score      │
+                   │  = sum([             │
+                   │    blinks >= min,    │
+                   │    head_moved,       │
+                   │    motion            │
+                   │  ])                  │
+                   └──────────┬───────────┘
+                              │
+                         ┌────┴────┐
+                         │ Score?  │
+                         └────┬────┘
+                              │
+               ┌──────────────┴──────────────┐
+               │ < 2                         │ >= 2
+               ↓                             ↓
+        ┌─────────────┐             ┌──────────────┐
+        │ NOT LIVE    │             │ LIVE PERSON  │
+        │ (Photo/Video│             │ (Real Human) │
+        │  Detected)  │             │              │
+        └─────────────┘             └──────────────┘
+               │                             │
+               ↓                             ↓
+        ┌─────────────┐             ┌──────────────┐
+        │ REJECT      │             │ PROCEED TO   │
+        │ AUTH        │             │ FACE RECOG   │
+        └─────────────┘             └──────────────┘
+```
+
+---
+
+## State Transitions
+
+```
+         START
+           ↓
+    ┌──────────────┐
+    │ Initializing │
+    └──────┬───────┘
+           │
+           ↓
+    ┌──────────────┐
+    │ Waiting for  │ ←──────────┐
+    │ Face         │            │
+    └──────┬───────┘            │
+           │                    │
+           ↓ Face Detected      │
+    ┌──────────────┐            │
+    │ Checking     │            │
+    │ Liveness     │            │ No Face
+    └──────┬───────┘            │
+           │                    │
+           ↓ Liveness Pass      │
+    ┌──────────────┐            │
+    │ Recognizing  │            │
+    │ Face         │            │
+    └──────┬───────┘            │
+           │                    │
+       ┌───┴────┐               │
+       │ Match? │               │
+       └───┬────┘               │
+           │                    │
+    ┌──────┴──────┐             │
+    │ YES     NO  │             │
+    ↓             ↓             │
+┌────────┐  ┌──────────┐       │
+│SUCCESS │  │ TIMEOUT  │───────┘
+│(Auth'd)│  │ (Retry)  │
+└────────┘  └──────────┘
+    │             │
+    └─────┬───────┘
+          ↓
+    ┌──────────────┐
+    │ Start DMS    │
+    │ Monitoring   │
+    └──────────────┘
+```
+
+---
+
+## Data Flow
+
+```
+Camera Frame (BGR)
+       ↓
+SCRFD Detector (NPU)
+       ↓
+Face Bounding Box + 5 Keypoints
+       │
+       ├────────────────────────────→ Liveness Detector
+       │                                      ↓
+       │                           ┌──────────────────┐
+       │                           │ MediaPipe        │ (optional)
+       │                           │ 468 landmarks    │
+       │                           └────────┬─────────┘
+       │                                    │
+       │                           ┌────────┴─────────┐
+       │                           │ Feature          │
+       │                           │ Extraction       │
+       │                           └────────┬─────────┘
+       │                                    │
+       │                           ┌────────┴─────────┐
+       │                           │ • Blink count    │
+       │                           │ • Head pose      │
+       │                           │ • Micro-motion   │
+       │                           └────────┬─────────┘
+       │                                    │
+       │                           ┌────────┴─────────┐
+       │                           │ Liveness Score   │
+       │                           │ (2/3 checks)     │
+       │                           └────────┬─────────┘
+       │                                    │
+       │                           ┌────────┴─────────┐
+       │                           │ is_live: bool    │
+       │                           └────────┬─────────┘
+       │                                    │
+       └────────────────────────────────────┤
+                                            ↓
+                            ┌───────────────────────────┐
+                            │ IF is_live == True:       │
+                            │   → Face Alignment        │
+                            │   → FR Model (NPU)        │
+                            │   → Embedding (512-dim)   │
+                            │   → Compare with DB       │
+                            │   → Return (name, id)     │
+                            └───────────────────────────┘
+```
+
+---
+
+## Timing Diagram
+
+```
+Time (seconds)    0    1    2    3    4    5    6    7    8    9    10
+                  │    │    │    │    │    │    │    │    │    │    │
+Camera Active:    ├────────────────────────────────────────────────────┤
+                  │                                                    │
+Face Detection:   │ X  X  X  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓ │
+                  │          ↑                                         │
+Liveness Check:   │          ├─────────────────────────┐              │
+                  │          │  Blinks: 0...1...2 ✓   │              │
+                  │          │  Pose:   collecting...✓ │              │
+                  │          │  Motion: buffering...✓  │              │
+                  │          └─────────────────────────┘              │
+                  │                                    ↑               │
+Face Recognition: │                                    ├───────────┐  │
+                  │                                    │  Match... │  │
+                  │                                    │  Name: ✓  │  │
+                  │                                    └───────────┘  │
+                  │                                                ↑   │
+Result:           │                                                │   │
+✓ AUTHENTICATED   │                                                └───┤
+(4-6 seconds)     │                                                    │
+
+Time (seconds)    0    1    2    3    4    5    6    7    8    9    10
+                  │    │    │    │    │    │    │    │    │    │    │
+Camera Active:    ├────────────────────────────────────────────────────┤
+                  │                                                    │
+Face Detection:   │ X  X  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓ │
+(PHOTO ATTACK)    │       ↑                                            │
+Liveness Check:   │       ├────────────────────────────────────────┐  │
+                  │       │  Blinks: 0...0...0...0...0...0 ✗      │  │
+                  │       │  Pose:   no variation ✗                │  │
+                  │       │  Motion: no motion detected ✗          │  │
+                  │       └────────────────────────────────────────┘  │
+                  │                                                 ↑  │
+Face Recognition: │                                                 │  │
+(SKIPPED)         │                                                 │  │
+                  │                                                 │  │
+Result:           │                                                 │  │
+✗ LIVENESS FAILED │                                                 └──┤
+(10 second timeout)                                                    │
+```
+
+---
+
+This visual representation shows the complete flow from startup to authentication
+result, including all decision points and data transformations.

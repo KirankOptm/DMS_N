@@ -1,0 +1,50 @@
+# Python virtual environment
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Model files (too large for git — share via Google Drive / NXP server)
+*.tflite
+*.onnx
+*.h5
+*.pb
+*.caffemodel
+
+# Zip archives
+*.zip
+
+# Images / screenshots
+*.png
+*.jpg
+*.JPG
+*.jpeg
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Old working copies (share separately if needed)
+working_DMS-23-1-2026/
+working_DMS-28-1-26/
+workng_DMS-22-01-2026/
+
+# External repos cloned inside
+tensorflow-yolov4-tflite/
+nxp-dms-reference/
+nxp-dms-repo.zip
+
+# Calibration data
+calib_fr/
+
+# C build outputs
+dms_imx93_c/

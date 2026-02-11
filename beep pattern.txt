@@ -1,0 +1,18 @@
+# 1. QUICK DOUBLE BEEP (urgent warning)
+buzzer_beep(times=2, on_s=0.1, off_s=0.1)
+
+# 2. LONG ALERT TONE (serious warning)
+buzzer_beep(times=1, on_s=0.5, off_s=0.0)
+
+# 3. TRIPLE BEEP (critical alert)
+buzzer_beep(times=3, on_s=0.15, off_s=0.15)
+
+# 4. PULSING ALARM (repeating pattern)
+buzzer_beep(times=5, on_s=0.08, off_s=0.08)
+
+# 5. SOS PATTERN (3 short, 3 long, 3 short)
+buzzer_beep(times=3, on_s=0.1, off_s=0.1)  # Short
+time.sleep(0.3)
+buzzer_beep(times=3, on_s=0.3, off_s=0.1)  # Long
+time.sleep(0.3)
+buzzer_beep(times=3, on_s=0.1, off_s=0.1)  # Short

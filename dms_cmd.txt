@@ -1,0 +1,32 @@
+##only face recog
+python3 dms_integrated_mdp_yolo_log.py \
+  --remote_server 192.168.1.190 \
+  --remote_port 5000 \
+  --model best_640.onnx \
+  --disable_mediapipe \
+  --disable_yolo \
+  --enable_auth
+
+---------------------------------
+python3 dms_integrated_mdp_yolo.py   
+--enable_auth   
+--enable_liveness   
+--model best_640.onnx   
+--yolo_conf 0.20   
+--yolo_iou 0.45   
+--no_stream  
+
+--------------------------------------
+## only mediapipe
+python3 dms_integrated_mdp_yolo_log.py  \
+ --remote_server 192.168.1.190 \
+ --remote_port 5000 \
+ --model best_640.onnx \   
+ --disable_yolo
+--------------------------------------
+## only seatbelt
+python3 dms_integrated_mdp_yolo_log.py  \
+ --remote_server 192.168.1.190 \
+ --remote_port 5000 \
+ --model best_640.onnx \   
+ --disable_mediapipe

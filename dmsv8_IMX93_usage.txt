@@ -1,0 +1,220 @@
+============================================================
+DMS v8 (MediaPipe) - IMX93 Wide-Angle Camera Usage Guide
+============================================================
+
+HARDWARE:
+- IMX93 Board (2x Cortex-A55 @ 1.7GHz)
+- 2MP Wide-Angle Camera on /dev/video3
+
+ISSUE:
+Wide-angle camera introduces distortion at edges, affecting
+face detection accuracy. Solution: crop center + resize.
+
+============================================================
+RECOMMENDED SETTINGS FOR 2MP WIDE-ANGLE CAMERA
+============================================================
+
+Option 1: Crop 25% from edges, resize to 640x480
+-------------------------------------------------
+python dmsv8.py \
+    --enable_streaming \
+    --crop_center 0.25 \
+    --resize_width 640 \
+    --resize_height 480
+
+Effect:
+- Original: 1920x1080 (2MP) → Crop: 960x540 → Resize: 640x480
+- Removes 25% distorted edges, focuses on driver area
+- Standard 640x480 for optimal MediaPipe performance
+
+
+Option 2: Crop 30% from edges, resize to 640x480
+-------------------------------------------------
+python dmsv8.py \
+    --enable_streaming \
+    --crop_center 0.30 \
+    --resize_width 640 \
+    --resize_height 480
+
+Effect:
+- Original: 1920x1080 → Crop: 768x432 → Resize: 640x480
+- More aggressive crop for severely distorted cameras
+- Better face centering
+
+
+Option 3: Crop 20% from edges, keep original resolution
+--------------------------------------------------------
+python dmsv8.py \
+    --enable_streaming \
+    --crop_center 0.20
+
+Effect:
+- Original: 1920x1080 → Crop: 1152x648
+- Minimal processing, good if distortion is light
+- Higher resolution for face detection
+
+
+Option 4: Only resize (no crop)
+--------------------------------
+python dmsv8.py \
+    --enable_streaming \
+    --resize_width 640 \
+    --resize_height 480
+
+Effect:
+- Original: 1920x1080 → Resize: 640x480
+- Reduces processing load without cropping
+- Use if distortion is acceptable
+
+
+============================================================
+PARAMETER EXPLANATION
+============================================================
+
+--crop_center <0.0-0.5>
+  Percentage to crop from each edge (top, bottom, left, right)
+  
+  Examples:
+  - 0.20 = Crop 20% from each edge (removes outer 40% total)
+  - 0.25 = Crop 25% from each edge (removes outer 50% total)
+  - 0.30 = Crop 30% from each edge (removes outer 60% total)
+  
+  Effect on 1920x1080:
+  - 0.20: 1920x1080 → 1152x648 (60% width, 60% height)
+  - 0.25: 1920x1080 → 960x540  (50% width, 50% height)
+  - 0.30: 1920x1080 → 768x432  (40% width, 40% height)
+
+
+--resize_width / --resize_height
+  Final resolution after cropping
+  
+  Recommended: 640x480
+  - Standard DMS resolution
+  - Good balance: quality vs performance
+  - MediaPipe works well at this resolution
+
+
+--enable_streaming
+  Enable MJPEG streaming on port 8080
+  View in VLC: vlc http://<board-ip>:8080/video
+
+
+--mjpeg_port <port>
+  Custom streaming port (default: 8080)
+
+
+============================================================
+TESTING PROCEDURE ON IMX93
+============================================================
+
+Step 1: Test without crop (baseline)
+-------------------------------------
+python dmsv8.py --enable_streaming
+
+- Check if face is detected
+- Note if edges cause false detections
+- Observe CPU usage
+
+
+Step 2: Test with 25% crop + resize
+------------------------------------
+python dmsv8.py --enable_streaming --crop_center 0.25 --resize_width 640 --resize_height 480
+
+- Verify face detection improves
+- Check if distortion is reduced
+- Compare CPU usage (should be lower)
+
+
+Step 3: Adjust crop if needed
+------------------------------
+If face still at edge:
+python dmsv8.py --enable_streaming --crop_center 0.20 --resize_width 640 --resize_height 480
+
+If need more centering:
+python dmsv8.py --enable_streaming --crop_center 0.30 --resize_width 640 --resize_height 480
+
+
+Step 4: Verify in VLC
+---------------------
+vlc http://<board-ip>:8080/video
+
+- Check if frame looks centered
+- Verify driver's face is in focus area
+- Ensure no critical areas are cropped out
+
+
+============================================================
+EXPECTED RESULTS
+============================================================
+
+BEFORE (No Crop):
+- CPU: ~100-135% (single-core on dual-core board)
+- Face detection: May fail at edges due to distortion
+- Frame rate: ~15-20 FPS
+- Resolution: 1920x1080
+
+AFTER (Crop 25% + Resize 640x480):
+- CPU: ~80-110% (reduced due to smaller resolution)
+- Face detection: More reliable, centered
+- Frame rate: ~20-25 FPS (faster processing)
+- Resolution: 640x480 (processed area)
+
+
+============================================================
+ADDITIONAL OPTIONS
+============================================================
+
+Disable calibration countdown:
+python dmsv8.py --enable_streaming --crop_center 0.25 --resize_width 640 --resize_height 480 --calibration_time 0
+
+Adjust detection thresholds:
+python dmsv8.py --enable_streaming --crop_center 0.25 --resize_width 640 --resize_height 480 --ear_threshold 0.20 --mar_threshold 2.5
+
+Custom streaming port:
+python dmsv8.py --enable_streaming --mjpeg_port 8090 --crop_center 0.25 --resize_width 640 --resize_height 480
+
+
+============================================================
+TROUBLESHOOTING
+============================================================
+
+Issue: Face not detected after crop
+Solution: Reduce crop_center (try 0.15 or 0.20)
+
+Issue: Still distorted at edges
+Solution: Increase crop_center (try 0.30 or 0.35)
+
+Issue: Frame too small in VLC
+Solution: Don't resize, only crop:
+  python dmsv8.py --enable_streaming --crop_center 0.25
+
+Issue: High CPU usage
+Solution: Use smaller resize or increase frame skip
+
+Issue: Camera not opening
+Solution: Check /dev/video3 exists, or change in code line 130
+
+
+============================================================
+RECOMMENDED FINAL COMMAND FOR IMX93
+============================================================
+
+python dmsv8.py \
+    --enable_streaming \
+    --crop_center 0.25 \
+    --resize_width 640 \
+    --resize_height 480 \
+    --calibration_time 10
+
+This provides:
+✓ Center crop removes 50% distorted area
+✓ Standard 640x480 resolution for optimal performance
+✓ MJPEG streaming for VLC viewing
+✓ 10-second calibration for gaze/head centering
+✓ Expected CPU: 80-110% on IMX93
+
+
+View stream:
+vlc http://<board-ip>:8080/video
+
+============================================================

@@ -1,0 +1,143 @@
+[2026-01-21 10:52:46.474] Eye_closure Frame 27
+  Data Proc: 6.77 ms
+  Algorithm: 1071.86 ms
+  KSS Calc:  129.02 ms
+  Buzzer:    5.38 ms
+  ─────────────────────────────
+  END-TO-END: 1213.03 ms
+  KSS Pipeline: avg=1213.0ms (n=1)
+
+[2026-01-21 10:53:01.947] Eye_closure Frame 47
+  Data Proc: 28.09 ms
+  Algorithm: 924.87 ms
+  KSS Calc:  107.84 ms
+  Buzzer:    0.31 ms
+  ─────────────────────────────
+  END-TO-END: 1061.12 ms
+  KSS Pipeline: avg=1137.1ms (n=2)
+
+[2026-01-21 10:53:17.186] Eye_closure Frame 71
+  Data Proc: 7.54 ms
+  Algorithm: 1038.90 ms
+  KSS Calc:  136.48 ms
+  Buzzer:    0.29 ms
+  ─────────────────────────────
+  END-TO-END: 1183.22 ms
+  KSS Pipeline: avg=1152.5ms (n=3)
+
+[2026-01-21 10:53:30.426] Eye_closure Frame 99
+  Data Proc: 2.97 ms
+  Algorithm: 797.13 ms
+  KSS Calc:  58.05 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 858.39 ms
+  KSS Pipeline: avg=1078.9ms (n=4)
+
+[2026-01-21 10:53:44.785] Eye_closure Frame 127
+  Data Proc: 3.24 ms
+  Algorithm: 803.47 ms
+  KSS Calc:  58.86 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 865.80 ms
+  KSS Pipeline: avg=1036.3ms (n=5)
+
+[2026-01-21 10:53:56.490] Eye_closure Frame 151
+  Data Proc: 2.93 ms
+  Algorithm: 619.40 ms
+  KSS Calc:  58.29 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 680.86 ms
+  KSS Pipeline: avg=977.1ms (n=6)
+
+[2026-01-21 10:54:11.130] Eye_closure Frame 179
+  Data Proc: 3.37 ms
+  Algorithm: 782.94 ms
+  KSS Calc:  62.31 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 848.84 ms
+  KSS Pipeline: avg=958.8ms (n=7)
+
+[2026-01-21 10:54:25.344] Eye_closure Frame 209
+  Data Proc: 3.02 ms
+  Algorithm: 786.31 ms
+  KSS Calc:  62.12 ms
+  Buzzer:    0.24 ms
+  ─────────────────────────────
+  END-TO-END: 851.69 ms
+  KSS Pipeline: avg=945.4ms (n=8)
+
+[2026-01-21 10:54:41.227] Eye_closure Frame 241
+  Data Proc: 3.11 ms
+  Algorithm: 779.18 ms
+  KSS Calc:  58.91 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 841.43 ms
+  KSS Pipeline: avg=933.8ms (n=9)
+
+[2026-01-21 10:54:57.053] Eye_closure Frame 275
+  Data Proc: 3.16 ms
+  Algorithm: 629.17 ms
+  KSS Calc:  59.68 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 692.25 ms
+  KSS Pipeline: avg=909.7ms (n=10)
+
+[2026-01-21 10:55:15.252] Eye_closure Frame 315
+  Data Proc: 5.64 ms
+  Algorithm: 1184.41 ms
+  KSS Calc:  132.09 ms
+  Buzzer:    1.00 ms
+  ─────────────────────────────
+  END-TO-END: 1323.14 ms
+  KSS Pipeline: avg=947.3ms (n=11)
+
+[2026-01-21 10:55:31.029] Eye_closure Frame 347
+  Data Proc: 8.17 ms
+  Algorithm: 1345.03 ms
+  KSS Calc:  58.62 ms
+  Buzzer:    0.24 ms
+  ─────────────────────────────
+  END-TO-END: 1412.05 ms
+  KSS Pipeline: avg=986.0ms (n=12)
+
+[2026-01-21 10:55:44.969] Eye_closure Frame 375
+  Data Proc: 4.81 ms
+  Algorithm: 1402.92 ms
+  KSS Calc:  78.21 ms
+  Buzzer:    5.67 ms
+  ─────────────────────────────
+  END-TO-END: 1491.61 ms
+  KSS Pipeline: avg=1024.9ms (n=13)
+
+[2026-01-21 10:56:00.762] Eye_closure Frame 413
+  Data Proc: 2.97 ms
+  Algorithm: 617.73 ms
+  KSS Calc:  58.18 ms
+  Buzzer:    0.23 ms
+  ─────────────────────────────
+  END-TO-END: 679.11 ms
+  KSS Pipeline: avg=1000.2ms (n=14)
+
+[2026-01-21 10:56:15.970] Eye_closure Frame 449
+  Data Proc: 2.94 ms
+  Algorithm: 606.50 ms
+  KSS Calc:  77.37 ms
+  Buzzer:    0.29 ms
+  ─────────────────────────────
+  END-TO-END: 687.10 ms
+  KSS Pipeline: avg=979.3ms (n=15)
+
+[2026-01-21 10:56:34.461] Eye_closure Frame 491
+  Data Proc: 2.99 ms
+  Algorithm: 608.26 ms
+  KSS Calc:  58.42 ms
+  Buzzer:    0.24 ms
+  ─────────────────────────────
+  END-TO-END: 669.91 ms
+  KSS Pipeline: avg=960.0ms (n=16)

@@ -1,0 +1,139 @@
+============================================================
+  NPU PMU PROFILING SUMMARY — i.MX 93 Ethos-U65 (1 GHz)
+  Date: 10 Feb 2026
+  Camera: 640x480, 16.7 FPS
+  Models: 3 Vela-compiled TFLite (INT8 internal, FLOAT32 I/O)
+  PMU Events: AXI0=SRAM, AXI1=DDR, Active, Idle
+============================================================
+
+
+1. PER-MODEL RESULTS (avg of 10 runs, warmup excluded)
+------------------------------------------------------
+
+  MODEL 1: BlazeFace (Face Detection)     
+  File:       face_detection_ptq_vela.tflite (181 KB)
+  Input:      [1, 128, 128, 3] float32
+  Output:     [1,896,1] scores + [1,896,16] boxes
+  Delegated:  1 of 4 nodes on NPU, 3 on CPU (quantize/dequantize)
+
+    Cycle Counter:    1,324,925
+    AXI0 (SRAM):      105,760
+    AXI1 (DDR):       38,515
+    Active Cycles:    1,324,243
+    Idle Cycles:      9,475
+    Wall Time:        1.71 ms (std 0.05 ms)
+
+    NPU Utilization:  99.29%  [1,324,243 / (1,324,243 + 9,475)]
+    AXI0/AXI1 Ratio:  2.75x   (SRAM dominant = compute-bound)
+    NPU Time @1GHz:   1.325 ms
+    CPU Overhead:     0.385 ms (22.5%)
+    Character:        COMPUTE-BOUND (good)
+
+
+  MODEL 2: Face Landmark (468 points)
+  File:       face_landmark_ptq_vela.tflite (654 KB)
+  Input:      [1, 192, 192, 3] float32
+  Output:     [1,1,1,1] score + [1,1,1,1404] landmarks (468x3)
+  Delegated:  1 of 4 nodes on NPU, 3 on CPU
+
+    Cycle Counter:    2,614,792
+    AXI0 (SRAM):      53,520
+    AXI1 (DDR):       49,891
+    Active Cycles:    2,614,111
+    Idle Cycles:      9,315
+    Wall Time:        3.18 ms (std 0.02 ms)
+
+    NPU Utilization:  99.64%  [2,614,111 / (2,614,111 + 9,315)]
+    AXI0/AXI1 Ratio:  1.07x   (SRAM ~ DDR = borderline memory)
+    NPU Time @1GHz:   2.615 ms
+    CPU Overhead:     0.565 ms (17.8%)
+    Character:        COMPUTE-BOUND (borderline, weights don't fully fit SRAM)
+
+
+  MODEL 3: Iris Landmark (eye contour + iris)
+  File:       iris_landmark_ptq_vela.tflite (714 KB)
+  Input:      [1, 64, 64, 3] float32
+  Output:     [1,213] eye contour (71x3) + [1,15] iris (5x3)
+  Delegated:  1 of 4 nodes on NPU, 3 on CPU
+
+    Cycle Counter:    2,028,778
+    AXI0 (SRAM):      295,685
+    AXI1 (DDR):       101,423
+    Active Cycles:    2,028,097
+    Idle Cycles:      9,324
+    Wall Time:        2.25 ms (std 0.04 ms)
+
+    NPU Utilization:  99.54%  [2,028,097 / (2,028,097 + 9,324)]
+    AXI0/AXI1 Ratio:  2.92x   (SRAM dominant = compute-bound)
+    NPU Time @1GHz:   2.029 ms
+    CPU Overhead:     0.221 ms (9.8%)
+    Character:        COMPUTE-BOUND (good)
+    Note:             Heaviest per-pixel model (714 KB for 64x64 input)
+                      Run 2x per frame (left eye + right eye)
+
+
+2. PER-FRAME TOTAL (1 face detected)
+-------------------------------------
+
+  Component               | NPU Cycles  | NPU Time  | Wall Time | % of Frame
+  ------------------------+-------------+-----------+-----------+-----------
+  BlazeFace (x1)          | 1,324,925   | 1.325 ms  | 1.71 ms   |  2.9%
+  Face Landmark (x1)      | 2,614,792   | 2.615 ms  | 3.18 ms   |  5.3%
+  Iris Left Eye (x1)      | 2,028,778   | 2.029 ms  | 2.25 ms   |  3.8%
+  Iris Right Eye (x1)     | 2,028,778   | 2.029 ms  | 2.25 ms   |  3.8%
+  ------------------------+-------------+-----------+-----------+-----------
+  TOTAL MODELS            | 7,997,273   | 7.998 ms  | 9.39 ms   | 15.7%
+  Python/OpenCV overhead  |     —       |    —      | 50.5 ms   | 84.3%
+  ------------------------+-------------+-----------+-----------+-----------
+  TOTAL FRAME             |     —       |    —      | 59.9 ms   | 100%
+                          |             |           | (16.7 FPS)|
+
+
+3. KEY FINDINGS
+---------------
+
+  [1] ALL 3 MODELS: 99.3-99.6% NPU utilization
+      - Near-perfect. No model is idle/waiting for data.
+      - Vela re-optimization will give negligible gains.
+
+  [2] NPU IS NOT THE BOTTLENECK
+      - 4 model invocations = 9.39 ms (15.7% of frame)
+      - Python/OpenCV = 50.5 ms (84.3% of frame)
+      - To reach 25+ FPS, optimize CPU-side code, not NPU models.
+
+  [3] IRIS IS THE DENSEST MODEL
+      - 714 KB weights for 64x64 input = very deep network
+      - 2.03M cycles for 4,096 pixels vs Face Landmark 2.61M for 36,864 pixels
+      - That's 495 cycles/pixel (Iris) vs 71 cycles/pixel (Landmark)
+      - Run 2x per frame = 4.5 ms total (48% of model budget)
+
+  [4] FACE LANDMARK HAS WEAKEST MEMORY PROFILE
+      - AXI0/AXI1 = 1.07x (nearly equal SRAM and DDR reads)
+      - 654 KB weights don't fully fit in Ethos-U65 SRAM
+      - Not causing problems now (idle < 0.4%)
+      - If adding more models, this one degrades first
+
+  [5] CPU OVERHEAD BREAKDOWN (per invoke)
+      - BlazeFace:     0.385 ms (dequantize 912 float32 outputs)
+      - Face Landmark: 0.565 ms (dequantize 1404 float32 outputs)
+      - Iris:          0.221 ms (dequantize 228 float32 outputs)
+      - Total per frame: 1.392 ms (3 CPU nodes per model = 12 CPU nodes)
+
+
+4. OPTIMIZATION PRIORITY (to increase FPS)
+-------------------------------------------
+
+  Priority | Action                                    | Potential Gain
+  ---------+-------------------------------------------+--------------
+  1        | Skip iris on alternate frames (DONE)      | ~2.25 ms avg
+  2        | Reduce mesh drawing (468 circles/frame)   | ~5-10 ms
+  3        | Resize camera to 320x240                  | ~3-5 ms
+  4        | Move preprocessing to C/C++               | ~10-15 ms
+  5        | Use cv2.UMat (GPU-accel OpenCV if avail)  | ~5-10 ms
+
+
+============================================================
+  CONCLUSION: NPU performance is optimal (99.5% avg util).
+  FPS is limited by Python/OpenCV at 84% of frame time.
+  Current 16.7 FPS is reasonable for pure-Python 3-model DMS.
+============================================================
