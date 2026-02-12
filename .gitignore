@@ -6,6 +6,11 @@ __pycache__/
 *.pyc
 
 # Model files (too large for git — share via Google Drive / NXP server)
+# Exceptions: track these specific PTQ Vela models
+!palm_detection_ptq_vela.tflite
+!hand_landmark_ptq_vela.tflite
+!palm_detection_ptq.tflite
+!hand_landmark_ptq.tflite
 *.tflite
 *.onnx
 *.h5
