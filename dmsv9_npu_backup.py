@@ -1613,7 +1613,7 @@ cached_right_eye_contour = None
 # From logs: CENTER H=0.48-0.51, V=0.47-0.52; DOWN V=0.60+; RIGHT H=0.56+
 GAZE_HORIZONTAL_THRESHOLD = 0.05  # LEFT < 0.45, RIGHT > 0.55
 GAZE_VERTICAL_THRESHOLD = 0.06    # UP < 0.44, DOWN > 0.56
-GAZE_SMOOTHING_FRAMES = 5         # frames to smooth gaze direction (5 for stability)
+GAZE_SMOOTHING_FRAMES = 3         # frames to smooth gaze direction (3 for responsiveness)
 gaze_history = []                 # history buffer for smoothing
 current_gaze_direction = "CENTER"
 gaze_h_ratio = 0.5
@@ -1899,47 +1899,58 @@ while cap.isOpened():
     # Only update gaze when eyes are OPEN (iris unreliable when closed)
     eyes_open_for_gaze = iris_avg_ratio >= 0.18  # need eyes reasonably open
     
-    # Classify gaze direction
-    # For 45-degree RIGHT-side camera:
-    #   - Looking at road (FORWARD) = iris toward inner/left corner = h_ratio ~0.48-0.51
-    #   - Looking RIGHT (mirror) = iris toward outer/right corner = h_ratio ~0.56+
-    #   - Looking DOWN = v_ratio ~0.60+
-    # Center points from actual log observations
-    GAZE_H_CENTER = 0.50  # actual center from logs
-    GAZE_V_CENTER = 0.50  # vertical center
+    # Classify gaze direction (from gaze_tracker.py reference)
+    # For 45-degree RIGHT-side camera with 10cm elevation:
+    #   CENTER: H ~0.50, V ~0.50
+    #   RIGHT: H > 0.58 (looking at right mirror)
+    #   LEFT: H < 0.42 (looking toward road)
+    #   DOWN: V > 0.58 (looking at instruments)
+    #   UP: V < 0.42 (rare)
+    GAZE_H_CENTER = 0.50
+    GAZE_V_CENTER = 0.50
+    GAZE_H_THRESH = 0.08  # ±0.08 from center for LEFT/RIGHT
+    GAZE_V_THRESH = 0.08  # ±0.08 from center for UP/DOWN
+    
+    # Initialize classification variables
+    h_class = "CENTER_H"
+    v_class = "CENTER_V"
     
     if eyes_open_for_gaze:
-        # Calculate deviations from center
-        h_dev = gaze_h_ratio - GAZE_H_CENTER  # positive = RIGHT, negative = LEFT
-        v_dev = gaze_v_ratio - GAZE_V_CENTER  # positive = DOWN, negative = UP
-        
-        # Check if significant deviation in each direction
-        # Use HIGHER thresholds to avoid flicker
-        H_THRESH = 0.08  # RIGHT/LEFT needs clear horizontal movement
-        V_THRESH = 0.10  # DOWN/UP needs clear vertical movement
-        
-        h_significant = abs(h_dev) > H_THRESH
-        v_significant = abs(v_dev) > V_THRESH
-        
-        # Priority: DOWN > LEFT > RIGHT > UP > CENTER
-        # (Driver safety: DOWN=instruments, LEFT=road for right-side camera)
-        if v_significant and v_dev > 0 and v_dev > 0.12:
-            # Strong DOWN - definite instrument cluster look
-            raw_gaze = "DOWN"
-        elif h_significant and h_dev < 0:
-            # LEFT - looking toward road (important for side camera)
-            raw_gaze = "LEFT"
-        elif v_significant and v_dev > 0:
-            # DOWN - moderate vertical deviation
-            raw_gaze = "DOWN"
-        elif h_significant and h_dev > 0:
-            # RIGHT - only if clearly horizontal, not DOWN
-            raw_gaze = "RIGHT"
-        elif v_significant and v_dev < 0 and abs(v_dev) > 0.12:
-            # UP - needs strong upward look (rare, only if definite)
-            raw_gaze = "UP"
+        # Step 1: Classify horizontal and vertical INDEPENDENTLY
+        if gaze_h_ratio < (GAZE_H_CENTER - GAZE_H_THRESH):
+            h_class = "LEFT"
+        elif gaze_h_ratio > (GAZE_H_CENTER + GAZE_H_THRESH):
+            h_class = "RIGHT"
         else:
+            h_class = "CENTER_H"
+        
+        if gaze_v_ratio < (GAZE_V_CENTER - GAZE_V_THRESH):
+            v_class = "UP"
+        elif gaze_v_ratio > (GAZE_V_CENTER + GAZE_V_THRESH):
+            v_class = "DOWN"
+        else:
+            v_class = "CENTER_V"
+        
+        # Step 2: Combine with PRIORITY (vertical > horizontal, per gaze_tracker.py)
+        # Pure vertical movements
+        if v_class == "DOWN" and h_class == "CENTER_H":
+            raw_gaze = "DOWN"
+        elif v_class == "UP" and h_class == "CENTER_H":
+            raw_gaze = "UP"
+        # Pure horizontal movements
+        elif h_class == "LEFT" and v_class == "CENTER_V":
+            raw_gaze = "LEFT"
+        elif h_class == "RIGHT" and v_class == "CENTER_V":
+            raw_gaze = "RIGHT"
+        # Both centered
+        elif h_class == "CENTER_H" and v_class == "CENTER_V":
             raw_gaze = "CENTER"
+        else:
+            # Diagonal/mixed - PRIORITIZE VERTICAL (more important for drowsiness)
+            if v_class in ["UP", "DOWN"]:
+                raw_gaze = v_class
+            else:
+                raw_gaze = h_class if h_class in ["LEFT", "RIGHT"] else "CENTER"
     else:
         # Eyes closed - keep previous gaze direction
         raw_gaze = current_gaze_direction if current_gaze_direction != "CENTER" else "CENTER"
@@ -1958,10 +1969,10 @@ while cap.isOpened():
     
     # Debug: print gaze every 10 frames (more frequent for tuning)
     if fid % 10 == 0:
-        open_str = "OPEN" if eyes_open_for_gaze else "CLOSED"
-        h_dev = gaze_h_ratio - 0.50
-        v_dev = gaze_v_ratio - 0.50
-        print(f"[Gaze] H={gaze_h_ratio:.2f}({h_dev:+.2f}) V={gaze_v_ratio:.2f}({v_dev:+.2f}) -> {current_gaze_direction} (eye={open_str})")
+        h_dev = gaze_h_ratio - GAZE_H_CENTER
+        v_dev = gaze_v_ratio - GAZE_V_CENTER
+        eye_str = "OPEN" if eyes_open_for_gaze else "shut"
+        print(f"[Gaze] H={gaze_h_ratio:.2f}({h_dev:+.2f})={h_class} V={gaze_v_ratio:.2f}({v_dev:+.2f})={v_class} -> {raw_gaze} (sm={current_gaze_direction}) [{eye_str}]")
     
     # ---- STEP 4: Hand detection via Palm Detector + Hand Landmark NPU ----
     detected_hands = []  # list of (hand_lm_list_in_frame_coords, handedness)
