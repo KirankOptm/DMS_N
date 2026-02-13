@@ -1284,7 +1284,7 @@ parser.add_argument('--ear_threshold', type=float, default=0.24)
 parser.add_argument('--ear_partial_threshold', type=float, default=0.26)
 parser.add_argument('--eye_closed_frames_threshold', type=int, default=9)
 parser.add_argument('--blink_rate_threshold', type=int, default=5)
-parser.add_argument('--mar_threshold', type=float, default=0.65)
+parser.add_argument('--mar_threshold', type=float, default=0.45)  # 0.45 for outer lip landmarks (was 0.65 for inner)
 parser.add_argument('--yawn_threshold', type=int, default=3)
 parser.add_argument('--frame_width', type=int, default=1280)
 parser.add_argument('--frame_height', type=int, default=720)
@@ -1329,7 +1329,13 @@ print("[DMS] All 5 models loaded on NPU (face_det + face_lm + iris + palm_det + 
 # MediaPipe landmark indices (same as original dmsv8.py)
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-MOUTH = [13, 14, 78, 308]
+# MOUTH indices for MAR (Mouth Aspect Ratio):
+# - 0: Upper lip TOP center (outer edge)
+# - 17: Lower lip BOTTOM center (outer edge)  
+# - 61: Left inner mouth corner
+# - 291: Right inner mouth corner
+# This gives larger vertical distance when yawning vs old [13,14] which are too close
+MOUTH = [0, 17, 61, 291]
 # NOTE: MediaPipe 478-point model has iris at 469-477, but NXP model only outputs 468 points.
 # Use eye corner indices as fallback for iris center estimation.
 LEFT_IRIS_FALLBACK = [33, 133]    # left eye corners (valid in 468-point model)
@@ -1607,7 +1613,7 @@ cached_right_eye_contour = None
 # From logs: CENTER H=0.48-0.51, V=0.47-0.52; DOWN V=0.60+; RIGHT H=0.56+
 GAZE_HORIZONTAL_THRESHOLD = 0.05  # LEFT < 0.45, RIGHT > 0.55
 GAZE_VERTICAL_THRESHOLD = 0.06    # UP < 0.44, DOWN > 0.56
-GAZE_SMOOTHING_FRAMES = 3         # frames to smooth gaze direction
+GAZE_SMOOTHING_FRAMES = 5         # frames to smooth gaze direction (5 for stability)
 gaze_history = []                 # history buffer for smoothing
 current_gaze_direction = "CENTER"
 gaze_h_ratio = 0.5
@@ -1897,7 +1903,7 @@ while cap.isOpened():
     # For 45-degree RIGHT-side camera:
     #   - Looking at road (FORWARD) = iris toward inner/left corner = h_ratio ~0.48-0.51
     #   - Looking RIGHT (mirror) = iris toward outer/right corner = h_ratio ~0.56+
-    #   - Looking DOWN = v_ratio ~0.56+
+    #   - Looking DOWN = v_ratio ~0.60+
     # Center points from actual log observations
     GAZE_H_CENTER = 0.50  # actual center from logs
     GAZE_V_CENTER = 0.50  # vertical center
@@ -1907,23 +1913,31 @@ while cap.isOpened():
         h_dev = gaze_h_ratio - GAZE_H_CENTER  # positive = RIGHT, negative = LEFT
         v_dev = gaze_v_ratio - GAZE_V_CENTER  # positive = DOWN, negative = UP
         
-        # Check if significant deviation in either direction
-        h_significant = abs(h_dev) > GAZE_HORIZONTAL_THRESHOLD
-        v_significant = abs(v_dev) > GAZE_VERTICAL_THRESHOLD
+        # Check if significant deviation in each direction
+        # Use HIGHER thresholds to avoid flicker
+        H_THRESH = 0.08  # RIGHT/LEFT needs clear horizontal movement
+        V_THRESH = 0.10  # DOWN/UP needs clear vertical movement
         
-        # Determine direction based on LARGER deviation (not just priority)
-        if h_significant and v_significant:
-            # Both significant - pick the one with larger normalized deviation
-            h_norm = abs(h_dev) / GAZE_HORIZONTAL_THRESHOLD
-            v_norm = abs(v_dev) / GAZE_VERTICAL_THRESHOLD
-            if h_norm > v_norm:
-                raw_gaze = "RIGHT" if h_dev > 0 else "LEFT"
-            else:
-                raw_gaze = "DOWN" if v_dev > 0 else "UP"
-        elif h_significant:
-            raw_gaze = "RIGHT" if h_dev > 0 else "LEFT"
-        elif v_significant:
-            raw_gaze = "DOWN" if v_dev > 0 else "UP"
+        h_significant = abs(h_dev) > H_THRESH
+        v_significant = abs(v_dev) > V_THRESH
+        
+        # Priority: DOWN > LEFT > RIGHT > UP > CENTER
+        # (Driver safety: DOWN=instruments, LEFT=road for right-side camera)
+        if v_significant and v_dev > 0 and v_dev > 0.12:
+            # Strong DOWN - definite instrument cluster look
+            raw_gaze = "DOWN"
+        elif h_significant and h_dev < 0:
+            # LEFT - looking toward road (important for side camera)
+            raw_gaze = "LEFT"
+        elif v_significant and v_dev > 0:
+            # DOWN - moderate vertical deviation
+            raw_gaze = "DOWN"
+        elif h_significant and h_dev > 0:
+            # RIGHT - only if clearly horizontal, not DOWN
+            raw_gaze = "RIGHT"
+        elif v_significant and v_dev < 0 and abs(v_dev) > 0.12:
+            # UP - needs strong upward look (rare, only if definite)
+            raw_gaze = "UP"
         else:
             raw_gaze = "CENTER"
     else:
