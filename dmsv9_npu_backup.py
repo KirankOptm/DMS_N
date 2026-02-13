@@ -476,6 +476,54 @@ class IrisLandmarkDetector:
             self._diag_n += 1
         
         return ratio
+    
+    def compute_gaze(self, iris_center, eye_contour, side=0):
+        """
+        Compute gaze direction from iris position relative to eye boundaries.
+        
+        Args:
+            iris_center: (x, y) normalized 0-1 relative to eye crop
+            eye_contour: [N, 3] normalized eye contour points
+            side: 0 = left eye, 1 = right eye
+        
+        Returns:
+            h_ratio: horizontal position (0.0=left corner, 1.0=right corner)
+            v_ratio: vertical position (0.0=top eyelid, 1.0=bottom eyelid)
+        """
+        if iris_center is None or eye_contour is None or len(eye_contour) < 15:
+            return 0.5, 0.5
+        
+        # Eye corner points (0 and 8)
+        if side == 0:  # Left eye
+            left_corner = eye_contour[0][:2]
+            right_corner = eye_contour[8][:2]
+        else:  # Right eye (flipped, so swap)
+            left_corner = eye_contour[8][:2]
+            right_corner = eye_contour[0][:2]
+        
+        # Vertical boundary points (12=top, 4=bottom)
+        top_lid = eye_contour[12][:2]
+        bottom_lid = eye_contour[4][:2]
+        
+        # Horizontal ratio: iris x position between left (0.0) and right (1.0) corners
+        eye_width = right_corner[0] - left_corner[0]
+        if abs(eye_width) > 0.01:
+            h_ratio = (iris_center[0] - left_corner[0]) / eye_width
+        else:
+            h_ratio = 0.5
+        
+        # Vertical ratio: iris y position between top (0.0) and bottom (1.0)
+        eye_height = bottom_lid[1] - top_lid[1]
+        if abs(eye_height) > 0.01:
+            v_ratio = (iris_center[1] - top_lid[1]) / eye_height
+        else:
+            v_ratio = 0.5
+        
+        # Clamp to valid range
+        h_ratio = max(0.0, min(1.0, h_ratio))
+        v_ratio = max(0.0, min(1.0, v_ratio))
+        
+        return h_ratio, v_ratio
 
 
 # ============================================================
@@ -1555,6 +1603,18 @@ cached_iris_right_center = None
 cached_left_eye_contour = None
 cached_right_eye_contour = None
 
+# Gaze tracking using iris model
+# From logs: CENTER H=0.48-0.51, V=0.47-0.52; DOWN V=0.60+; RIGHT H=0.56+
+GAZE_HORIZONTAL_THRESHOLD = 0.05  # LEFT < 0.45, RIGHT > 0.55
+GAZE_VERTICAL_THRESHOLD = 0.06    # UP < 0.44, DOWN > 0.56
+GAZE_SMOOTHING_FRAMES = 3         # frames to smooth gaze direction
+gaze_history = []                 # history buffer for smoothing
+current_gaze_direction = "CENTER"
+gaze_h_ratio = 0.5
+gaze_v_ratio = 0.5
+cached_iris_left_norm = None      # normalized 0-1 iris center for gaze
+cached_iris_right_norm = None
+
 # --- Anti-flicker: temporal smoothing (matches MediaPipe internal filtering) ---
 # Face box EMA smoothing (stabilizes crop → stabilizes landmarks)
 smoothed_box = None
@@ -1731,6 +1791,8 @@ while cap.isOpened():
     iris_right_center = None
     left_eye_contour = None
     right_eye_contour = None
+    iris_left_norm = None   # normalized 0-1 iris center for gaze
+    iris_right_norm = None
     
     run_iris_this_frame = (fid % IRIS_SKIP_FRAMES == 0)
     
@@ -1745,6 +1807,7 @@ while cap.isOpened():
                     if left_eye_crop is not None and left_eye_crop.size > 0:
                         ic, left_eye_contour, _ = iris_landmark_detector.predict(left_eye_crop, side=0)
                         if ic is not None:
+                            iris_left_norm = ic  # Store normalized (0-1) for gaze
                             iris_left_center = np.array([
                                 lx1 + ic[0] * (lx2 - lx1),
                                 ly1 + ic[1] * (ly2 - ly1)
@@ -1761,6 +1824,7 @@ while cap.isOpened():
                     if right_eye_crop is not None and right_eye_crop.size > 0:
                         ic, right_eye_contour, _ = iris_landmark_detector.predict(right_eye_crop, side=1)
                         if ic is not None:
+                            iris_right_norm = ic  # Store normalized (0-1) for gaze
                             iris_right_center = np.array([
                                 rx1 + ic[0] * (rx2 - rx1),
                                 ry1 + ic[1] * (ry2 - ry1)
@@ -1773,12 +1837,16 @@ while cap.isOpened():
             cached_iris_right_center = iris_right_center
             cached_left_eye_contour = left_eye_contour
             cached_right_eye_contour = right_eye_contour
+            cached_iris_left_norm = iris_left_norm
+            cached_iris_right_norm = iris_right_norm
         else:
             # Reuse cached iris results
             iris_left_center = cached_iris_left_center
             iris_right_center = cached_iris_right_center
             left_eye_contour = cached_left_eye_contour
             right_eye_contour = cached_right_eye_contour
+            iris_left_norm = cached_iris_left_norm
+            iris_right_norm = cached_iris_right_norm
     
     # ---- Iris-based eye openness detection (NXP method) ----
     # Uses 71-point eye contour from iris model — more accurate than 6-point face landmark EAR
@@ -1802,6 +1870,84 @@ while cap.isOpened():
     # Typical values: open=0.25-0.40, closed=0.05-0.18
     iris_eye_closed = iris_avg_ratio > 0 and iris_avg_ratio < 0.20
     iris_eye_open = iris_avg_ratio >= 0.22
+    
+    # ---- GAZE TRACKING using iris model ----
+    gaze_left_h, gaze_left_v = 0.5, 0.5
+    gaze_right_h, gaze_right_v = 0.5, 0.5
+    
+    # Compute gaze for each eye using NORMALIZED iris center (0-1) and eye contour (0-1)
+    # Left eye gaze
+    if iris_left_norm is not None and left_eye_contour is not None:
+        gaze_left_h, gaze_left_v = iris_landmark_detector.compute_gaze(iris_left_norm, left_eye_contour, side=0)
+    
+    # Right eye gaze  
+    if iris_right_norm is not None and right_eye_contour is not None:
+        gaze_right_h, gaze_right_v = iris_landmark_detector.compute_gaze(iris_right_norm, right_eye_contour, side=1)
+    
+    # Average both eyes for final gaze ratio (filter out extreme values)
+    valid_h = [r for r in [gaze_left_h, gaze_right_h] if 0.15 < r < 0.85]
+    valid_v = [r for r in [gaze_left_v, gaze_right_v] if 0.15 < r < 0.85]
+    gaze_h_ratio = np.mean(valid_h) if valid_h else 0.5
+    gaze_v_ratio = np.mean(valid_v) if valid_v else 0.5
+    
+    # Only update gaze when eyes are OPEN (iris unreliable when closed)
+    eyes_open_for_gaze = iris_avg_ratio >= 0.18  # need eyes reasonably open
+    
+    # Classify gaze direction
+    # For 45-degree RIGHT-side camera:
+    #   - Looking at road (FORWARD) = iris toward inner/left corner = h_ratio ~0.48-0.51
+    #   - Looking RIGHT (mirror) = iris toward outer/right corner = h_ratio ~0.56+
+    #   - Looking DOWN = v_ratio ~0.56+
+    # Center points from actual log observations
+    GAZE_H_CENTER = 0.50  # actual center from logs
+    GAZE_V_CENTER = 0.50  # vertical center
+    
+    if eyes_open_for_gaze:
+        # Calculate deviations from center
+        h_dev = gaze_h_ratio - GAZE_H_CENTER  # positive = RIGHT, negative = LEFT
+        v_dev = gaze_v_ratio - GAZE_V_CENTER  # positive = DOWN, negative = UP
+        
+        # Check if significant deviation in either direction
+        h_significant = abs(h_dev) > GAZE_HORIZONTAL_THRESHOLD
+        v_significant = abs(v_dev) > GAZE_VERTICAL_THRESHOLD
+        
+        # Determine direction based on LARGER deviation (not just priority)
+        if h_significant and v_significant:
+            # Both significant - pick the one with larger normalized deviation
+            h_norm = abs(h_dev) / GAZE_HORIZONTAL_THRESHOLD
+            v_norm = abs(v_dev) / GAZE_VERTICAL_THRESHOLD
+            if h_norm > v_norm:
+                raw_gaze = "RIGHT" if h_dev > 0 else "LEFT"
+            else:
+                raw_gaze = "DOWN" if v_dev > 0 else "UP"
+        elif h_significant:
+            raw_gaze = "RIGHT" if h_dev > 0 else "LEFT"
+        elif v_significant:
+            raw_gaze = "DOWN" if v_dev > 0 else "UP"
+        else:
+            raw_gaze = "CENTER"
+    else:
+        # Eyes closed - keep previous gaze direction
+        raw_gaze = current_gaze_direction if current_gaze_direction != "CENTER" else "CENTER"
+    
+    # Smooth gaze with history
+    gaze_history.append(raw_gaze)
+    if len(gaze_history) > GAZE_SMOOTHING_FRAMES:
+        gaze_history.pop(0)
+    
+    # Most common gaze in recent history
+    if len(gaze_history) >= GAZE_SMOOTHING_FRAMES:
+        from collections import Counter
+        current_gaze_direction = Counter(gaze_history).most_common(1)[0][0]
+    else:
+        current_gaze_direction = raw_gaze
+    
+    # Debug: print gaze every 10 frames (more frequent for tuning)
+    if fid % 10 == 0:
+        open_str = "OPEN" if eyes_open_for_gaze else "CLOSED"
+        h_dev = gaze_h_ratio - 0.50
+        v_dev = gaze_v_ratio - 0.50
+        print(f"[Gaze] H={gaze_h_ratio:.2f}({h_dev:+.2f}) V={gaze_v_ratio:.2f}({v_dev:+.2f}) -> {current_gaze_direction} (eye={open_str})")
     
     # ---- STEP 4: Hand detection via Palm Detector + Hand Landmark NPU ----
     detected_hands = []  # list of (hand_lm_list_in_frame_coords, handedness)
@@ -2243,11 +2389,19 @@ while cap.isOpened():
             blink_counter = 0
             blink_timer = current_time
 
-        # YAWN DETECTION
+        # YAWN DETECTION using MAR (Mouth Aspect Ratio)
         mar = get_mar(landmarks, MOUTH, w, h)
         mar_deque.append(mar)
-        if mar > args.mar_threshold:
+        smoothed_mar = np.mean(mar_deque) if len(mar_deque) > 0 else mar
+        
+        # Yawn state: CLOSED (normal) vs YAWNING (mouth open wide)
+        yawn_state = "YAWNING" if smoothed_mar > args.mar_threshold else "NORMAL"
+        
+        if smoothed_mar > args.mar_threshold:
             yawn_counter += 1
+        else:
+            # Reset counter if mouth closes
+            yawn_counter = max(0, yawn_counter - 1)
 
         if yawn_counter > args.yawn_threshold:
             msg = "Warning: Yawning"
@@ -2255,6 +2409,10 @@ while cap.isOpened():
             last_msg = msg
             yawn_flag = True
             yawn_counter = 0
+        
+        # Debug: Print MAR values periodically
+        if fid % 30 == 0:
+            print(f"[MAR] raw={mar:.3f} smooth={smoothed_mar:.3f} thresh={args.mar_threshold:.2f} state={yawn_state} cnt={yawn_counter}")
 
         # GAZE ESTIMATION (using iris model output)
         gaze_x_norm = iris_center_avg[0] / w if iris_center_avg is not None else 0.5
@@ -2542,6 +2700,21 @@ while cap.isOpened():
         # Show adaptive range so user knows calibration is working
         cv2.putText(frame, f"EAR: {eye_display_ear:.3f} [{adaptive_ear_closed:.2f}-{adaptive_ear_open:.2f}]", 
                    (w - 250, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    # Gaze direction display
+    gaze_color = (0, 255, 0) if current_gaze_direction == "CENTER" else (0, 165, 255)  # Green if center, Orange if looking away
+    cv2.putText(frame, f"Gaze: {current_gaze_direction}", 
+               (w - 200, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, gaze_color, 2)
+    
+    # MAR/Yawn display
+    if landmarks is not None and len(mar_deque) > 0:
+        display_mar = np.mean(mar_deque)
+        yawn_display_state = "YAWNING" if display_mar > args.mar_threshold else "NORMAL"
+        mar_color = (0, 0, 255) if yawn_display_state == "YAWNING" else (0, 255, 0)  # Red if yawning
+        cv2.putText(frame, f"Mouth: {yawn_display_state}", 
+                   (w - 200, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mar_color, 2)
+        cv2.putText(frame, f"MAR: {display_mar:.3f} [>{args.mar_threshold:.2f}]", 
+                   (w - 250, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     # Update MJPEG stream
     if mjpeg_server is not None:
